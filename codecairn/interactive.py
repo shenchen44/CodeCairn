@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,7 @@ from app.services.agent_runtime import (
     ExtensionResult,
     TaskIntent,
 )
+from app.core.config import get_settings
 from app.services.openai.agent_loop import AgentRunResult
 from app.services.openai.policy import RuntimePolicy
 from app.services.openai.staged_runtime import StagedAgentRuntime
@@ -193,6 +195,11 @@ class InteractiveShell:
         self.session = session
         self.input_fn = input_fn
         self.output = output
+        self.color = (
+            bool(getattr(output, "isatty", lambda: False)())
+            and not os.environ.get("NO_COLOR")
+            and os.environ.get("TERM") != "dumb"
+        )
         self.default_intent = TaskIntent.change
         self.undo_stack: list[UndoRecord] = []
         self.repo_config = load_repo_config(repo_path)
@@ -207,10 +214,7 @@ class InteractiveShell:
         )
 
     def run(self) -> int:
-        self._write(
-            f"CodeCairn {__version__}  {self.repo_path}\n"
-            "Type a coding task or /help. Use Ctrl+D to exit.\n"
-        )
+        self._show_banner()
         while True:
             try:
                 line = self.input_fn(
@@ -368,7 +372,57 @@ class InteractiveShell:
             "  /exit                leave CodeCairn\n"
         )
 
+    def _show_banner(self) -> None:
+        settings = get_settings()
+        branch = self._branch_label()
+        path = self._display_path(self.repo_path)
+        session = (
+            self._display_path(self.session.path)
+            if self.session.path
+            else self.session.session_id
+        )
+        width = max(
+            56,
+            min(shutil.get_terminal_size(fallback=(88, 24)).columns, 110),
+        )
+        logo = [
+            "       .----.",
+            "      /______\\",
+            "        .--.",
+            "      _/____\\_",
+            "     /________\\",
+        ]
+        info = [
+            self._style(
+                f"CodeCairn v{__version__}",
+                "bold",
+            ),
+            (
+                f"{settings.openai_model}  |  "
+                f"{settings.openai_provider}  |  {self.policy.name}"
+            ),
+            f"{path}  |  {branch}  |  {self.repo_config.language}",
+            (
+                f"Sandbox: {settings.sandbox_base_image}  |  "
+                f"Mode: {self.default_intent.value}"
+            ),
+            f"Session: {session}",
+        ]
+        self._write("\n")
+        for index, line in enumerate(info):
+            mark = self._style(logo[index], "accent")
+            self._write(f"{mark}    {line}\n")
+        self._write(self._style("-" * width, "muted") + "\n")
+        self._write(
+            self._style(
+                "Natural-language tasks are ready. /help lists commands.",
+                "muted",
+            )
+            + "\n\n"
+        )
+
     def _show_status(self) -> None:
+        settings = get_settings()
         status = _run_git(
             self.repo_path,
             "status",
@@ -376,7 +430,13 @@ class InteractiveShell:
         ).stdout.strip()
         self._write(
             f"Repository: {self.repo_path}\n"
+            f"Branch: {self._branch_label()}\n"
+            f"Model: {settings.openai_model}\n"
+            f"Provider: {settings.openai_provider}\n"
             f"Runtime: {self.policy.name}\n"
+            f"Language: {self.repo_config.language}\n"
+            f"Test command: {self.repo_config.test_command}\n"
+            f"Sandbox: {settings.sandbox_base_image}\n"
             f"Mode: {self.default_intent.value}\n"
             f"Session: {self.session.path or self.session.session_id}\n"
             f"Workspace: {status or 'clean'}\n"
@@ -429,6 +489,52 @@ class InteractiveShell:
             self._write(f"Mode must be one of: {choices}\n")
             return
         self._write(f"Default mode: {self.default_intent.value}\n")
+
+    def _branch_label(self) -> str:
+        try:
+            branch = _run_git(
+                self.repo_path,
+                "branch",
+                "--show-current",
+            ).stdout.strip()
+            if not branch:
+                branch = _run_git(
+                    self.repo_path,
+                    "rev-parse",
+                    "--short",
+                    "HEAD",
+                ).stdout.strip()
+            dirty = bool(
+                _run_git(
+                    self.repo_path,
+                    "status",
+                    "--porcelain",
+                ).stdout
+            )
+            return f"{branch}{'*' if dirty else ''}"
+        except subprocess.CalledProcessError:
+            return "unknown"
+
+    @staticmethod
+    def _display_path(path: Path | None) -> str:
+        if path is None:
+            return ""
+        resolved = path.expanduser().resolve()
+        try:
+            relative = resolved.relative_to(Path.home())
+        except ValueError:
+            return str(resolved)
+        return f"~/{relative}"
+
+    def _style(self, text: str, role: str) -> str:
+        if not self.color:
+            return text
+        codes = {
+            "bold": "\033[1;97m",
+            "accent": "\033[38;5;37m",
+            "muted": "\033[38;5;244m",
+        }
+        return f"{codes.get(role, '')}{text}\033[0m"
 
     def _write(self, text: str) -> None:
         self.output.write(text)

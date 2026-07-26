@@ -4,4 +4,4 @@ from app.services.agent_runtime import AgentSession, CodingTask, TaskIntent
 
 __all__ = ["AgentSession", "CodingTask", "TaskIntent", "__version__"]
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"

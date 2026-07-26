@@ -170,8 +170,13 @@ def test_interactive_shell_runs_multiturn_command_and_undo(tmp_path):
     assert shell.run() == 0
     assert observed_intents == [TaskIntent.change, TaskIntent.review]
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "value = 1\n"
-    assert "Workspace changed. Use /diff or /undo." in output.getvalue()
-    assert "Undid: change the value" in output.getvalue()
+    rendered = output.getvalue()
+    assert f"CodeCairn v{__version__}" in rendered
+    assert "Sandbox:" in rendered
+    assert "Session:" in rendered
+    assert "\033[" not in rendered
+    assert "Workspace changed. Use /diff or /undo." in rendered
+    assert "Undid: change the value" in rendered
 
 
 def test_repository_resolution_and_session_path_are_stable(tmp_path):
