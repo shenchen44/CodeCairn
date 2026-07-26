@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4.1-mini"
     openai_base_url: str | None = None
     openai_provider: str = "openai"
+    openai_timeout_seconds: float = 90
+    openai_max_retries: int = 1
     github_app_id: str = ""
     github_webhook_secret: str = ""
     github_private_key_path: str = ""
@@ -30,6 +32,7 @@ class Settings(BaseSettings):
     github_api_base: str = "https://api.github.com"
     max_attempts: int = 3
     pr_review_label: str = "needs-human-review"
+    agent_runtime_variant: str = "full"
 
     @property
     def target_labels(self) -> set[str]:

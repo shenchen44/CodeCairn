@@ -8,6 +8,7 @@ from app.services.task_runner.orchestrator import get_artifact_content
 from app.db.session import get_db
 from app.services.github.auth import GitHubAuthService
 from app.services.github.pulls import GitHubPullRequestService
+from app.services.evaluation import build_agent_metrics
 from app.services.sandbox.limits import parse_diff_stats
 from app.services.task_runner.orchestrator import create_conflict_resolution_task, create_integration_task
 
@@ -892,6 +893,19 @@ def dashboard_page() -> Response:
 </body>
 </html>"""
     return Response(content=html, media_type="text/html")
+
+
+@router.get("/metrics")
+def agent_metrics(db: Session = Depends(get_db)) -> dict:
+    tasks = list(
+        db.scalars(
+            select(Task).options(
+                selectinload(Task.attempts),
+                selectinload(Task.artifacts),
+            )
+        )
+    )
+    return build_agent_metrics(tasks)
 
 
 @router.get("/prs")

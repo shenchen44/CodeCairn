@@ -24,3 +24,19 @@ def test_load_repo_config_file(workspace_tmp_dir) -> None:
     assert config.allowed_paths == ["app/"]
     assert config.blocked_paths == ["migrations/"]
     assert config.max_changed_files == 2
+
+
+def test_detects_javascript_repository_without_python_restriction(
+    workspace_tmp_dir,
+) -> None:
+    (workspace_tmp_dir / "package.json").write_text(
+        '{"scripts":{"test":"vitest run"}}',
+        encoding="utf-8",
+    )
+
+    config = load_repo_config(workspace_tmp_dir)
+
+    assert config.language == "typescript/javascript"
+    assert config.install_command == "npm install"
+    assert config.test_command == "npm test"
+    assert config.allowed_paths == [""]

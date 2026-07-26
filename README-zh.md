@@ -1,64 +1,47 @@
 # micro-swe-agent
 
-一个可本地自托管运行的 AI coding agent MVP。
+项目的核心定位是可嵌入、可扩展的通用 Coding Agent Runtime。核心只理解
+`CodingTask`、会话、工具、模型和生命周期事件；GitHub Issue、SWE-bench、
+交互式调用和自动化任务通过 adapter 接入。`full` Runtime 还提供声明式
+AgentGraph、EvidenceLedger、隔离 worktree 候选补丁和通用失败恢复。架构见
+[`docs/general_coding_agent_runtime.md`](docs/general_coding_agent_runtime.md)。
 
-它会监听 GitHub App 的 issue webhook，筛选低风险 issue，在隔离工作目录和 Docker 沙箱中为 Python 仓库生成最小补丁，运行 `pytest`，最多自我修复 3 轮，成功后推送分支、创建 PR、回写 issue 评论，并在 dashboard 中展示 PR、冲突状态和整合操作。
+GitHub App 是其中一种入口：它监听 Issue webhook，在隔离工作目录和 Docker
+Sandbox 中修改与验证仓库，成功后创建 PR。Runtime 也支持 SWE-bench
+adapter、只读 review、investigate、explain、多轮 Session、动态工具和
+非 GitHub 调用。
 
-## 为什么这个项目值得关注
-
-这个项目不是一个简单的聊天式代码助手，而是一个带完整执行闭环的 coding agent runtime：
-
-- 接收 GitHub issue webhook 并做任务编排
-- 在受限工具集中进行代码检索、编辑、patch 应用与测试
-- 通过状态机和最多 3 轮重试完成自修复
-- 自动创建 PR，并保留 artifact、diff、测试日志和任务轨迹
-
-## Agent 工程亮点
+## 当前功能
 
 - **Tool-calling agent loop**：支持 `list_files`、`search_code`、`read_file`、`write_file`、`apply_patch`、`run_tests`
+- **通用任务协议**：change / review / investigate / explain 共享同一核心，只有 change 任务允许修改工作区
+- **Pi-style 扩展机制**：运行时注册和切换工具，拦截 model/tool 生命周期事件
+- **树状会话**：JSONL 持久化、上下文续接和任意历史节点 fork
+- **多语言仓库能力**：自动识别 Python、JavaScript/TypeScript、Rust、Go、Java，并使用沙箱命令白名单
+- **混合代码检索**：BM25、AST 符号和 import graph 经 RRF 融合，返回可解释的检索来源
+- **多 Agent Runtime**：Supervisor 按复杂度选择标准链路或 Localization / Planner / Patch / Reviewer 深度链路
+- **长短期记忆**：失败写入 task memory，通过测试的方案才提升为 repository memory，并支持置信度、去重和失效
+- **Evidence Gates**：定位、计划和审查均使用强类型协议与可执行门禁
 - **Sandbox guardrails**：限制允许修改路径、阻止高风险命令、限制最大变更文件数和 diff 行数
 - **Observability**：记录 task 级与 attempt 级耗时、模型调用次数、工具调用次数
-- **Evaluation-ready**：提供最小 benchmark runner，可在固定任务集上输出成功率和耗时统计
-
-## 评测
-
-可以用最小 benchmark runner 在固定 fixture 上运行 agent，并输出 `benchmark_results/results.json`：
-
-```bash
-python scripts/run_benchmarks.py
-```
-
-输出会包含：
-
-- `success_rate`
-- `avg_duration_ms`
-- 每个任务的 `model_call_count`
-- 每个任务的 `tool_call_count`
-- patch 大小与测试结果
+- **SWE-bench adapter**：读取实例、运行不同 RuntimePolicy、导出官方 `model_patch`
+- **轨迹数据工具**：将结构化 rollout 转换为 SFT records、DPO preference pairs 和汇总结果
 
 ## 推荐使用方式
 
-- 你自己 clone 代码后在本机或自己的服务器上运行
-- 配自己的 GitHub App
-- 配自己的 OpenAI API Key
-- 让它自动处理你授权仓库里的 issue
+- 直接在本地仓库运行通用任务：
 
-## MVP 范围
+```bash
+python scripts/run_coding_task.py \
+  --repo /path/to/repository \
+  --intent review \
+  --objective "审查缓存模块的并发与失效策略" \
+  --session-file .agent/sessions/review.jsonl
+```
 
-- 仅支持 Python 仓库
-- 仅支持 `pytest`
-- 仅处理 `good first issue`、`bug`、`agent-fixable`
-- 仅允许最多 5 个文件、200 行 diff
-- 仅通过 GitHub App webhook 自动触发
-- 不做自动 merge、多语言、多 agent、数据库迁移/部署/支付/CI 等高风险改动
-
-## 适合谁使用
-
-- 想自己托管一个 AI 修 bug / 开 PR 工具的开发者
-- 想把它当作面试项目、课程项目、内部实验工具的人
-- 想在自己的 GitHub 仓库里验证 issue -> PR 自动闭环的人
-
-当前不建议直接把它做成面向陌生用户的开放 SaaS，因为 worker 需要访问宿主机 Docker，安全边界仍更适合"自己用"或"小团队内部用"。
+- 在本机或服务器上运行 Runtime
+- 配置 GitHub App 和模型 API
+- 处理授权仓库中的 Issue、交互式任务或 SWE-bench 实例
 
 ## 目录结构
 
@@ -81,6 +64,10 @@ python scripts/run_benchmarks.py
       fixtures/toy_repo/
     workers/
     main.py
+  experiments/
+    swe_alignment/
+  docs/
+    general_coding_agent_runtime.md
   secrets/
   .workspaces/
   .env.example
@@ -105,6 +92,7 @@ python scripts/run_benchmarks.py
 - `GET /repositories`：已记录仓库列表
 - `GET /dashboard`：PR review / merge / integration dashboard
 - `GET /dashboard/prs`：dashboard 数据接口
+- `GET /dashboard/metrics`：Agent 路由、门禁、成本、时延和结果指标
 - `POST /dashboard/prs/{task_id}/merge`：合并可 merge 的 PR
 - `POST /dashboard/prs/{task_id}/resolve-conflict`：为冲突 PR 创建 conflict resolution task
 - `POST /dashboard/integrations`：基于多个 PR 创建 integration task
@@ -117,13 +105,19 @@ python scripts/run_benchmarks.py
 - 创建基于默认分支的新分支
 - 读取 `.agent.yml` 或安全默认配置
 - 执行安装命令
-- 跑 OpenAI Responses API agent loop
+- 由 Supervisor 选择标准或深度多 Agent 执行链
+- 先运行只读 Localization Agent 和 evidence gate，再进入修改阶段
+- 通过 `retrieve_code` 执行 BM25 + AST + import graph 混合检索
+- 深度链路额外运行 Planner 和独立 Reviewer
 - 通过工具接口执行 `list_files`、`search_code`、`read_file`、`apply_patch`、`git_diff`、`run_tests`
+- 在重试中召回 task memory，测试通过后沉淀 repository memory
 - 最多 3 轮 patch -> test -> retry
 - 成功后 commit / push / create PR / issue comment
 - 失败后记录 failure reason 与 test log，并回写 issue comment
 - 支持 integration task
 - 支持 conflict resolution task
+
+通用 Runtime 结构见 `docs/general_coding_agent_runtime.md`。
 
 ### 状态机
 
@@ -150,6 +144,7 @@ testing -> ready_for_pr -> pr_opened -> done
 - `DATABASE_URL`
 - `OPENAI_API_KEY`
 - `OPENAI_MODEL`
+- `AGENT_RUNTIME_VARIANT`：`legacy`、`retrieval`、`memory` 或 `full`
 - `GITHUB_APP_ID`
 - `GITHUB_WEBHOOK_SECRET`
 - `GITHUB_PRIVATE_KEY_PATH`
@@ -357,7 +352,7 @@ OPENAI_API_KEY=...
 OPENAI_MODEL=gpt-4.1-mini
 ```
 
-当前实现使用 OpenAI Responses API，并保留了工具调用与 trace/artifact 结构，方便后续扩展。
+当前实现使用 OpenAI Responses API，并保留工具调用与 trace/artifact 结构用于审计。
 
 ## Worker 与 Docker 沙箱
 

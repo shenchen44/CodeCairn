@@ -21,6 +21,12 @@ test_micro_swe_agent.db
 
 # Workspaces (temp clone directories)
 .workspaces/
+.cache/
+
+# Experiment outputs
+outputs/
+logs/
+data/swe/*.jsonl
 
 # IDE
 .idea/

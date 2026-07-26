@@ -11,7 +11,11 @@ class OpenAIChatClient:
         client_kwargs = {"api_key": settings.openai_api_key}
         if settings.openai_base_url:
             client_kwargs["base_url"] = settings.openai_base_url
-        self.client = OpenAI(**client_kwargs)
+        self.client = OpenAI(
+            timeout=settings.openai_timeout_seconds,
+            max_retries=settings.openai_max_retries,
+            **client_kwargs,
+        )
 
     def create_completion(self, *, messages: list[dict], tools: list[dict] | None = None):
         extra_body = {"reasoning_split": True} if self.provider == "minimax" else None

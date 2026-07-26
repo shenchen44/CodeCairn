@@ -1,64 +1,46 @@
 # micro-swe-agent
 
-A self-hostable AI coding agent MVP.
+The project is an embeddable, extensible general-purpose coding agent runtime.
+Its core understands source-independent coding tasks, sessions, tools, models,
+and lifecycle events. GitHub Issues, SWE-bench, interactive clients, and
+automations connect through adapters. See
+[`docs/general_coding_agent_runtime.md`](docs/general_coding_agent_runtime.md).
 
-It listens for GitHub App issue webhooks, filters low-risk issues, generates minimal patches for Python repositories in isolated workspaces and Docker sandboxes, runs `pytest`, retries self-fix up to 3 rounds, then pushes a branch, creates a PR, comments on the issue, and displays PR/conflict/integration status in a dashboard.
+The included GitHub App is one product surface. The runtime also supports a
+SWE-bench adapter, read-only review, investigation, explanation, persistent
+multi-turn sessions, dynamic tools, and non-GitHub callers.
 
-## Why This Project Matters
-
-This is not a simple chat-based code assistant — it's a coding agent runtime with a complete execution loop:
-
-- Receives GitHub issue webhooks and orchestrates tasks
-- Searches code, edits, applies patches, and runs tests in a constrained tool set
-- Self-heals via a state machine with up to 3 retry rounds
-- Auto-creates PRs, preserving artifacts, diffs, test logs, and task traces
-
-## Agent Engineering Highlights
+## Features
 
 - **Tool-calling agent loop**: supports `list_files`, `search_code`, `read_file`, `write_file`, `apply_patch`, `run_tests`
+- **General task contract**: change, review, investigate, and explain tasks share one core; only change tasks can mutate the workspace
+- **Pi-style extension surface**: register and activate tools at runtime and intercept model/tool lifecycle events
+- **Tree sessions**: JSONL persistence, context continuation, and forks from any history entry
+- **Multi-language repository profiles**: Python, JavaScript/TypeScript, Rust, Go, and Java detection with sandboxed command allowlists
 - **Sandbox guardrails**: restricts allowed paths, blocks high-risk commands, limits max changed files and diff lines
 - **Observability**: records task-level and attempt-level latency, model call counts, tool call counts
-- **Evaluation-ready**: provides a minimal benchmark runner that outputs success rate and latency stats on a fixed task set
-
-## Evaluation
-
-Run the agent on fixed fixtures and output `benchmark_results/results.json`:
-
-```bash
-python scripts/run_benchmarks.py
-```
-
-Output includes:
-
-- `success_rate`
-- `avg_duration_ms`
-- `model_call_count` per task
-- `tool_call_count` per task
-- Patch size and test results
+- **Hybrid code retrieval**: BM25, AST symbols, and import graph results fused with RRF
+- **Multi-agent runtime**: Supervisor-selected Localization, Planner, Patch, and Reviewer stages
+- **Task and repository memory**: validated promotion, confidence, deduplication, and invalidation
+- **Evidence gates and ledger**: typed hand-offs and traceable requirement-to-verification links
+- **SWE-bench adapter**: instance loading, RuntimePolicy execution, and official `model_patch` export
+- **Trajectory data tools**: convert structured rollouts into SFT records, DPO preference pairs, and summaries
 
 ## Recommended Usage
 
-- Clone the code and run it on your own machine or server
-- Configure your own GitHub App
-- Configure your own OpenAI API key
-- Let it automatically process issues in repositories you authorize
+- Run a source-independent task directly on a local repository:
 
-## MVP Scope
+```bash
+python scripts/run_coding_task.py \
+  --repo /path/to/repository \
+  --intent review \
+  --objective "Review cache concurrency and invalidation" \
+  --session-file .agent/sessions/review.jsonl
+```
 
-- Python repositories only
-- `pytest` only
-- Processes only `good first issue`, `bug`, `agent-fixable` labels
-- Max 5 changed files, 200 lines of diff
-- GitHub App webhook auto-trigger only
-- No auto-merge, multi-language, multi-agent, DB migrations/deployment/payments/CI, or other high-risk changes
-
-## Who Is This For
-
-- Developers who want to self-host an AI bug-fixing / PR-opening tool
-- Anyone treating this as a portfolio project, course project, or internal experimentation tool
-- People who want to verify the issue → PR automatic loop in their own GitHub repositories
-
-Currently not recommended as a public SaaS for unknown users, since the worker accesses the host machine's Docker and the security boundary is better suited for "personal use" or "small team internal use".
+- Run the Runtime on a local machine or server
+- Configure a GitHub App and model API
+- Process authorized GitHub Issues, interactive tasks, or SWE-bench instances
 
 ## Directory Structure
 
@@ -81,6 +63,10 @@ Currently not recommended as a public SaaS for unknown users, since the worker a
       fixtures/toy_repo/
     workers/
     main.py
+  experiments/
+    swe_alignment/
+  docs/
+    swe_alignment.md
   secrets/
   .workspaces/
   .env.example
@@ -117,8 +103,12 @@ Currently not recommended as a public SaaS for unknown users, since the worker a
 - Creates a new branch based on the default branch
 - Reads `.agent.yml` or safe default config
 - Runs install commands
-- Runs OpenAI Responses API agent loop
-- Executes `list_files`, `search_code`, `read_file`, `apply_patch`, `git_diff`, `run_tests` via tool interfaces
+- Uses the Supervisor to select a standard or deep multi-agent execution graph
+- Runs read-only localization and evidence gates before workspace mutation
+- Uses BM25, AST, and import-graph hybrid retrieval
+- Runs Planner and independent Reviewer stages when selected
+- Executes `list_files`, `search_code`, `read_file`, `apply_patch`, `git_diff`, and `run_tests`
+- Recalls task memory during retries and promotes validated repository memory
 - Up to 3 rounds of patch → test → retry
 - On success: commit / push / create PR / issue comment
 - On failure: records failure reason and test log, comments on issue

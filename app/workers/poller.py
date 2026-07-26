@@ -1,23 +1,34 @@
 import asyncio
 import logging
 import tempfile
-from datetime import datetime
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from time import perf_counter
 
+import openai
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
+from app.services.adapters import github_issue_task
 from app.core.config import get_settings
 from app.db.models.task import Task, TaskArtifact, TaskArtifactType, TaskAttempt, TaskResultStatus, TaskStatus
+from app.db.models.memory import MemoryKind, MemoryScope
 from app.db.session import SessionLocal
 from app.services.comments.formatter import format_issue_failure_comment, format_issue_success_comment, format_pr_body
 from app.services.github.auth import GitHubAuthService
 from app.services.github.issues import GitHubIssueService
 from app.services.github.pulls import GitHubPullRequestService
 from app.services.github.repos import build_clone_url
-from app.services.openai.agent_loop import AgentLoop, AgentResponseParseError
+from app.services.openai.agent_loop import AgentResponseParseError
+from app.services.openai.staged_runtime import LocalizationGateError
+from app.services.openai.staged_runtime import EvidenceGateError
+from app.services.openai.staged_runtime import PhaseGateError
+from app.services.openai.staged_runtime import StagedAgentRuntime as AgentLoop
 from app.services.openai.tools import AgentToolbox, ToolExecutionError
+from app.services.memory import recall, remember, snapshot_evidence
+from app.services.orchestration import attach_verification
+from app.services.openai.policy import RuntimePolicy, get_runtime_policy
 from app.services.sandbox.git_ops import checkout_new_branch, clone_repo, commit_all, diff, push_branch, set_remote_url
 from app.services.sandbox.limits import enforce_patch_limits, parse_diff_stats
 from app.services.sandbox.repo_config import load_repo_config
@@ -27,6 +38,28 @@ from app.services.task_runner.orchestrator import build_branch_name, ensure_work
 
 logger = logging.getLogger(__name__)
 
+MAX_CONCURRENT_TASKS = 3
+MAX_API_RETRIES = 3
+API_RETRY_BASE_DELAY = 10  # seconds
+
+
+# ---------------------------------------------------------------------------
+# Error classification
+# ---------------------------------------------------------------------------
+
+class RetryableError(Exception):
+    """Transient errors that should be retried (API rate limits, network issues)."""
+    pass
+
+
+class FatalError(Exception):
+    """Permanent errors that should immediately fail the task."""
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Data helpers
+# ---------------------------------------------------------------------------
 
 def ensure_mapping(value: object) -> dict:
     if isinstance(value, dict):
@@ -38,10 +71,16 @@ def _get_raw_webhook(task: Task) -> dict:
     raw_webhook = get_artifact_content(task, TaskArtifactType.raw_webhook)
     if isinstance(raw_webhook, dict):
         return raw_webhook
-    raise ValueError("raw_webhook_artifact_missing")
+    raise FatalError("raw_webhook_artifact_missing")
 
 
-def _build_issue_context(task: Task) -> dict:
+def _build_issue_context(
+    task: Task,
+    db=None,
+    *,
+    repo_path: Path | None = None,
+    policy: RuntimePolicy | None = None,
+) -> dict:
     issue_context = {
         "mode": "integration" if task.issue.github_issue_number <= 0 else "issue_fix",
         "title": task.issue.title,
@@ -53,7 +92,78 @@ def _build_issue_context(task: Task) -> dict:
     integration_request = get_artifact_content(task, TaskArtifactType.integration_request)
     if isinstance(integration_request, dict):
         issue_context["integration_request"] = integration_request
+    policy = policy or get_runtime_policy()
+    if db is not None and policy.enable_memory:
+        memory_query = f"{task.issue.title}\n{task.issue.body}"
+        issue_context["memory_context"] = recall(
+            db,
+            repository_id=task.repository_id,
+            task_id=task.id,
+            query=memory_query,
+            limit=6,
+            repo_path=repo_path,
+        )
     return issue_context
+
+
+def _remember_attempt_failure(
+    db,
+    task: Task,
+    failure: dict,
+    *,
+    localization: dict | None = None,
+) -> None:
+    remember(
+        db,
+        repository_id=task.repository_id,
+        task_id=task.id,
+        scope=MemoryScope.task,
+        kind=MemoryKind.failure,
+        content={
+            "issue": task.issue.title,
+            "failure_type": failure.get("failure_type", "unknown"),
+            "test_exit_code": failure.get("test_exit_code"),
+            "error_summary": failure.get("error_summary", "")[:800],
+            "guidance": failure.get("guidance", ""),
+            "localization_hypothesis": (
+                (localization or {}).get("root_cause_hypothesis")
+            ),
+        },
+        evidence=(localization or {}).get("evidence", []),
+        confidence=0.7,
+        source_commit=task.base_commit,
+    )
+
+
+def _remember_success(
+    db,
+    task: Task,
+    *,
+    summary: object,
+    localization: dict | None,
+    test_command: str,
+    repo_path: Path,
+) -> None:
+    summary_mapping = ensure_mapping(summary)
+    remember(
+        db,
+        repository_id=task.repository_id,
+        scope=MemoryScope.repository,
+        kind=MemoryKind.solution,
+        content={
+            "issue": task.issue.title,
+            "root_cause": summary_mapping.get("root_cause"),
+            "patch_plan": summary_mapping.get("patch_plan"),
+            "files": (localization or {}).get("candidate_files", []),
+            "test_command": test_command,
+        },
+        evidence=snapshot_evidence(
+            repo_path,
+            (localization or {}).get("evidence", []),
+        ),
+        confidence=float((localization or {}).get("confidence", 0.7)),
+        source_commit=task.base_commit,
+    )
 
 
 def _is_conflict_resolution_task(task: Task) -> bool:
@@ -62,12 +172,42 @@ def _is_conflict_resolution_task(task: Task) -> bool:
 
 
 def _utcnow() -> datetime:
-    return datetime.utcnow()
+    return datetime.now(timezone.utc)
 
 
 def _elapsed_ms(start_time: float) -> int:
-    return int((perf_counter() - start_time) * 1000)
+    return int((time.perf_counter() - start_time) * 1000)
 
+
+# ---------------------------------------------------------------------------
+# API retry helper for async calls
+# ---------------------------------------------------------------------------
+
+async def _retry_async_api_call(fn, max_retries: int = MAX_API_RETRIES):
+    """Retry an async API call with exponential backoff for transient errors."""
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            return await fn()
+        except (openai.RateLimitError, openai.APITimeoutError, openai.APIConnectionError) as exc:
+            last_exc = exc
+            delay = API_RETRY_BASE_DELAY * (2 ** attempt)
+            logger.warning(f"api_retry attempt={attempt+1} delay={delay}s error={exc}")
+            await asyncio.sleep(delay)
+        except openai.APIStatusError as exc:
+            if exc.status_code >= 500:
+                last_exc = exc
+                delay = API_RETRY_BASE_DELAY * (2 ** attempt)
+                logger.warning(f"api_retry attempt={attempt+1} delay={delay}s status={exc.status_code}")
+                await asyncio.sleep(delay)
+            else:
+                raise
+    raise RetryableError(f"api_exhausted_retries: {last_exc}")
+
+
+# ---------------------------------------------------------------------------
+# Attempt recording
+# ---------------------------------------------------------------------------
 
 def _record_attempt(
     db,
@@ -91,6 +231,18 @@ def _record_attempt(
     tool_name: str | None = None,
     tool_arguments: dict | None = None,
     raw_response: str | None = None,
+    total_input_tokens: int = 0,
+    total_output_tokens: int = 0,
+    turn_durations_ms: list[int] | None = None,
+    localization: dict | None = None,
+    route_decision: dict | None = None,
+    plan: dict | None = None,
+    review: dict | None = None,
+    agent_graph: dict | None = None,
+    evidence_ledger: dict | None = None,
+    runtime_events: list[dict] | None = None,
+    tournament: dict | None = None,
+    recovery: dict | None = None,
 ) -> None:
     diff_stats = parse_diff_stats(diff_text)
     attempt = TaskAttempt(
@@ -131,6 +283,9 @@ def _record_attempt(
                 "tool_arguments": tool_arguments,
                 "error": error_text,
                 "raw_response": raw_response,
+                "total_input_tokens": total_input_tokens,
+                "total_output_tokens": total_output_tokens,
+                "turn_durations_ms": turn_durations_ms or [],
             },
         )
     )
@@ -142,12 +297,69 @@ def _record_attempt(
                 content={"stdout": test_stdout or "", "stderr": test_stderr or "", "exit_code": test_exit_code},
             )
         )
+    phases = {
+        "supervisor": route_decision,
+        "agent_graph": agent_graph,
+        "localization": localization,
+        "planning": plan,
+        "review": review,
+        "evidence_ledger": evidence_ledger,
+        "patch_tournament": tournament,
+        "patch_recovery": recovery,
+    }
+    for phase, phase_result in phases.items():
+        if phase_result is None:
+            continue
+        db.add(
+            TaskArtifact(
+                task_id=task.id,
+                artifact_type=TaskArtifactType.agent_phase,
+                content={
+                    "attempt": attempt_index,
+                    "phase": phase,
+                    "contract_version": phase_result.get("contract_version", "1"),
+                    "result": phase_result,
+                },
+            )
+        )
+    if runtime_events:
+        db.add(
+            TaskArtifact(
+                task_id=task.id,
+                artifact_type=TaskArtifactType.agent_phase,
+                content={
+                    "attempt": attempt_index,
+                    "phase": "runtime_events",
+                    "contract_version": "1",
+                    "result": {"events": runtime_events},
+                },
+            )
+        )
 
+
+# ---------------------------------------------------------------------------
+# Main orchestrator
+# ---------------------------------------------------------------------------
 
 async def process_task(task_id: str) -> None:
+    """Process a single task through the full agent pipeline.
+
+    Phases:
+    1. Clone & setup workspace
+    2. Run agent loop (up to max_attempts rounds)
+    3. Create PR on success, or comment failure on issue
+
+    Error handling:
+    - RetryableError (API rate limits, timeouts) => logged, task stays triaged for next poll
+    - FatalError (install failed, webhook missing) => task marked failed immediately
+    """
     settings = get_settings()
+    runtime_policy = get_runtime_policy(
+        getattr(settings, "agent_runtime_variant", "full")
+    )
     db = SessionLocal()
-    task_started_clock = perf_counter()
+    task_started_clock = time.perf_counter()
+
     try:
         task = db.scalar(
             select(Task)
@@ -165,7 +377,9 @@ async def process_task(task_id: str) -> None:
         raw_webhook = _get_raw_webhook(task)
         installation_id = raw_webhook["installation"]["id"]
         auth_service = GitHubAuthService()
-        installation_token = await auth_service.get_installation_token(installation_id)
+        installation_token = await _retry_async_api_call(
+            lambda: auth_service.get_installation_token(installation_id)
+        )
         workspace_root = ensure_workspace_root()
 
         transition_task(db, task, TaskStatus.sandbox_ready)
@@ -187,7 +401,7 @@ async def process_task(task_id: str) -> None:
 
             repo_config = load_repo_config(repo_path)
             sandbox = SandboxRunner()
-            install_started = perf_counter()
+            install_started = time.perf_counter()
             install_result = sandbox.install_dependencies(repo_path, repo_config.install_command)
             task.install_duration_ms = _elapsed_ms(install_started)
             db.add(
@@ -204,7 +418,7 @@ async def process_task(task_id: str) -> None:
             )
             db.commit()
             if install_result.exit_code != 0:
-                raise RuntimeError(
+                raise FatalError(
                     f"install_failed: stdout={install_result.stdout.strip()} stderr={install_result.stderr.strip()}"
                 )
 
@@ -215,28 +429,56 @@ async def process_task(task_id: str) -> None:
             successful_result = None
             successful_attempt_index = None
             successful_diff_text = ""
+            previous_failure = None  # Track failure for reflective retry
+
             for attempt_index in range(1, settings.max_attempts + 1):
                 attempt_started_at = _utcnow()
-                attempt_started_clock = perf_counter()
+                attempt_started_clock = time.perf_counter()
                 task.attempt_count = attempt_index
                 db.add(task)
                 db.commit()
 
+                legacy_context = _build_issue_context(
+                    task,
+                    db,
+                    repo_path=repo_path,
+                    policy=runtime_policy,
+                )
                 toolbox = AgentToolbox(
                     repo_path=repo_path,
                     repo_config=repo_config,
-                    issue_context=_build_issue_context(task),
+                    issue_context=legacy_context,
+                    task_context=github_issue_task(legacy_context),
                     sandbox_runner=sandbox,
+                    runtime_policy=runtime_policy,
                 )
                 result = None
                 tool_name = None
                 tool_arguments = None
                 error_text = None
                 raw_response = None
-                model_started = perf_counter()
+                model_started = time.perf_counter()
+
+                # Build reflective retry context from previous failure
+                retry_context = None
+                if previous_failure and attempt_index > 1:
+                    retry_context = (
+                        f"=== RETRY ATTEMPT {attempt_index} ===\n"
+                        f"Your previous patch FAILED.\n\n"
+                        f"Failure type: {previous_failure.get('failure_type', 'unknown')}\n"
+                        f"Test exit code: {previous_failure.get('test_exit_code', '?')}\n"
+                        f"Error summary:\n{previous_failure.get('error_summary', 'N/A')}\n\n"
+                        f"Guidance: {previous_failure.get('guidance', 'Analyze the failure carefully.')}\n\n"
+                        f"What to do now:\n"
+                        f"1. Analyze WHY your previous fix failed (see error output above)\n"
+                        f"2. If the failure_type is 'assertion_failure', your root cause analysis was likely wrong — re-read the issue\n"
+                        f"3. If the failure_type is 'import_error' or 'name_error', you broke a dependency — use get_imports to check\n"
+                        f"4. Try a DIFFERENT approach — do not repeat the same fix\n"
+                        f"5. Use find_definition to verify you are modifying the correct function\n"
+                    )
 
                 try:
-                    result = agent.run(toolbox)
+                    result = agent.run(toolbox, retry_context=retry_context)
                     model_duration_ms = _elapsed_ms(model_started)
                     task.model_call_count += result.model_call_count
                     task.tool_call_count += result.tool_call_count
@@ -254,8 +496,15 @@ async def process_task(task_id: str) -> None:
                     )
 
                     transition_task(db, task, TaskStatus.testing)
-                    test_started = perf_counter()
+                    test_started = time.perf_counter()
                     test_result = sandbox.run_tests(repo_path, repo_config.test_command)
+                    result.evidence_ledger = attach_verification(
+                        result.evidence_ledger,
+                        command=repo_config.test_command,
+                        exit_code=test_result.exit_code,
+                        stdout=test_result.stdout,
+                        stderr=test_result.stderr,
+                    )
                     task.patch_duration_ms = (task.patch_duration_ms or 0) + model_duration_ms
                     test_duration_ms = _elapsed_ms(test_started)
                     task.test_duration_ms = (task.test_duration_ms or 0) + test_duration_ms
@@ -276,15 +525,54 @@ async def process_task(task_id: str) -> None:
                         duration_ms=_elapsed_ms(attempt_started_clock),
                         model_duration_ms=model_duration_ms,
                         tool_call_count=result.tool_call_count,
+                        total_input_tokens=result.total_input_tokens,
+                        total_output_tokens=result.total_output_tokens,
+                        turn_durations_ms=result.turn_durations_ms,
+                        localization=result.localization,
+                        route_decision=result.route_decision,
+                        plan=result.plan,
+                        review=result.review,
+                        agent_graph=result.agent_graph,
+                        evidence_ledger=result.evidence_ledger,
+                        runtime_events=result.runtime_events,
+                        tournament=result.tournament,
+                        recovery=result.recovery,
                     )
                     db.commit()
 
                     if test_result.exit_code == 0:
+                        if runtime_policy.enable_memory:
+                            _remember_success(
+                                db,
+                                task,
+                                summary=result.summary,
+                                localization=result.localization,
+                                test_command=repo_config.test_command,
+                                repo_path=repo_path,
+                            )
                         transition_task(db, task, TaskStatus.ready_for_pr)
                         successful_result = result
                         successful_attempt_index = attempt_index
                         successful_diff_text = diff_text
+                        previous_failure = None
                         break
+
+                    # Track failure for reflective retry
+                    from app.services.openai.tools import _classify_test_failure, FAILURE_GUIDANCE
+                    failure_type = _classify_test_failure(test_result.stdout, test_result.stderr)
+                    previous_failure = {
+                        "failure_type": failure_type,
+                        "test_exit_code": test_result.exit_code,
+                        "error_summary": (test_result.stderr or test_result.stdout or "")[-800:],
+                        "guidance": FAILURE_GUIDANCE.get(failure_type, FAILURE_GUIDANCE["unknown"]),
+                    }
+                    if runtime_policy.enable_memory:
+                        _remember_attempt_failure(
+                            db,
+                            task,
+                            previous_failure,
+                            localization=result.localization,
+                        )
 
                     if attempt_index < settings.max_attempts:
                         transition_task(db, task, TaskStatus.retrying)
@@ -294,6 +582,8 @@ async def process_task(task_id: str) -> None:
                     else:
                         mark_task_failed(db, task, "tests_failed", {"attempts": attempt_index})
                         db.commit()
+                except RetryableError:
+                    raise  # Let outer handler deal with it
                 except Exception as exc:
                     diff_text = diff(repo_path)
                     error_text = str(exc)
@@ -310,8 +600,59 @@ async def process_task(task_id: str) -> None:
                     if isinstance(exc, AgentResponseParseError):
                         raw_response = exc.raw_response
                         tool_name = "final_response"
+                    localization = result.localization if result is not None else None
+                    route_decision = result.route_decision if result is not None else None
+                    plan = result.plan if result is not None else None
+                    review = result.review if result is not None else None
+                    agent_graph = (
+                        result.agent_graph if result is not None else None
+                    )
+                    evidence_ledger = (
+                        result.evidence_ledger if result is not None else None
+                    )
+                    runtime_events = (
+                        result.runtime_events if result is not None else None
+                    )
+                    tournament = (
+                        result.tournament if result is not None else None
+                    )
+                    recovery = (
+                        result.recovery if result is not None else None
+                    )
+                    if isinstance(exc, LocalizationGateError):
+                        localization = {
+                            **exc.localization,
+                            "gate": {
+                                "passed": False,
+                                "reasons": exc.reasons,
+                            },
+                        }
+                    if isinstance(exc, PhaseGateError):
+                        route_decision = exc.context.get("route")
+                        localization = exc.context.get("localization")
+                        plan = exc.context.get("plan")
+                        review = exc.context.get("review")
+                        rejected_phase = (
+                            review if exc.phase == "review" else plan
+                        )
+                        if rejected_phase is not None:
+                            rejected_phase = {
+                                **rejected_phase,
+                                "gate": {
+                                    "passed": False,
+                                    "reasons": exc.reasons,
+                                },
+                            }
+                            if exc.phase == "review":
+                                review = rejected_phase
+                            else:
+                                plan = rejected_phase
+                    if isinstance(exc, EvidenceGateError):
+                        agent_graph = exc.graph
+                        evidence_ledger = exc.ledger
+                        runtime_events = exc.events
                     if diff_text.strip():
-                        test_started = perf_counter()
+                        test_started = time.perf_counter()
                         test_result = sandbox.run_tests(repo_path, repo_config.test_command)
                         test_command = repo_config.test_command
                         test_exit_code = test_result.exit_code
@@ -319,6 +660,13 @@ async def process_task(task_id: str) -> None:
                         test_stderr = test_result.stderr
                         test_duration_ms = _elapsed_ms(test_started)
                         task.test_duration_ms = (task.test_duration_ms or 0) + test_duration_ms
+                        evidence_ledger = attach_verification(
+                            evidence_ledger,
+                            command=repo_config.test_command,
+                            exit_code=test_result.exit_code,
+                            stdout=test_result.stdout,
+                            stderr=test_result.stderr,
+                        )
                     _record_attempt(
                         db,
                         task,
@@ -340,8 +688,34 @@ async def process_task(task_id: str) -> None:
                         tool_name=tool_name,
                         tool_arguments=tool_arguments,
                         raw_response=raw_response,
+                        total_input_tokens=result.total_input_tokens if result is not None else 0,
+                        total_output_tokens=result.total_output_tokens if result is not None else 0,
+                        turn_durations_ms=result.turn_durations_ms if result is not None else None,
+                        localization=localization,
+                        route_decision=route_decision,
+                        plan=plan,
+                        review=review,
+                        agent_graph=agent_graph,
+                        evidence_ledger=evidence_ledger,
+                        runtime_events=runtime_events,
+                        tournament=tournament,
+                        recovery=recovery,
                     )
                     db.commit()
+                    # Track exception failure for reflective retry
+                    previous_failure = {
+                        "failure_type": "tool_error" if isinstance(exc, ToolExecutionError) else "parse_error" if isinstance(exc, AgentResponseParseError) else "unknown",
+                        "test_exit_code": test_exit_code,
+                        "error_summary": error_text[:800] if error_text else "N/A",
+                        "guidance": f"Your tool call failed: {error_text[:200]}. Read the error carefully and adjust your approach.",
+                    }
+                    if runtime_policy.enable_memory:
+                        _remember_attempt_failure(
+                            db,
+                            task,
+                            previous_failure,
+                            localization=localization,
+                        )
                     if attempt_index < settings.max_attempts:
                         transition_task(db, task, TaskStatus.retrying)
                         db.commit()
@@ -490,6 +864,17 @@ async def process_task(task_id: str) -> None:
                 db.commit()
         finally:
             temp_dir_obj.cleanup()
+    except RetryableError as exc:
+        logger.warning(f"task_retryable_error task_id={task_id} error={exc}")
+        # Task stays in triaged state, will be picked up by next poll
+    except FatalError as exc:
+        logger.error(f"task_fatal_error task_id={task_id} error={exc}")
+        task = db.get(Task, task_id)
+        if task is not None:
+            mark_task_failed(db, task, "fatal_error", {"error": str(exc)})
+            task.finished_at = _utcnow()
+            task.total_duration_ms = _elapsed_ms(task_started_clock)
+            db.commit()
     except Exception as exc:
         logger.exception("task processing failed", extra={"task_id": task_id})
         task = db.get(Task, task_id)
@@ -502,21 +887,39 @@ async def process_task(task_id: str) -> None:
         db.close()
 
 
+# ---------------------------------------------------------------------------
+# Worker loop with concurrency
+# ---------------------------------------------------------------------------
+
 async def poll_forever() -> None:
+    """Poll for triaged tasks and process them with bounded concurrency."""
     settings = get_settings()
+    running_tasks: set[asyncio.Task] = set()
+
     while True:
-        db = SessionLocal()
-        try:
-            task = db.scalar(
-                select(Task)
-                .where(Task.status == TaskStatus.triaged)
-                .order_by(Task.created_at.asc())
-                .options(selectinload(Task.issue), selectinload(Task.repository), selectinload(Task.artifacts))
-            )
-            if task is not None:
-                await process_task(task.id)
-        finally:
-            db.close()
+        # Clean up completed tasks
+        done_tasks = {t for t in running_tasks if t.done()}
+        for t in done_tasks:
+            if t.exception():
+                logger.error(f"background_task_failed error={t.exception()}")
+        running_tasks -= done_tasks
+
+        # Start new tasks if under concurrency limit
+        if len(running_tasks) < MAX_CONCURRENT_TASKS:
+            db = SessionLocal()
+            try:
+                task = db.scalar(
+                    select(Task)
+                    .where(Task.status == TaskStatus.triaged)
+                    .order_by(Task.created_at.asc())
+                    .options(selectinload(Task.issue), selectinload(Task.repository), selectinload(Task.artifacts))
+                )
+                if task is not None:
+                    logger.info(f"dispatching_task task_id={task.id}")
+                    running_tasks.add(asyncio.create_task(process_task(task.id)))
+            finally:
+                db.close()
+
         await asyncio.sleep(settings.worker_poll_interval)
 
 

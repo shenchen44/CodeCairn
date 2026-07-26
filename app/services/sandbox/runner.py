@@ -37,7 +37,10 @@ class SandboxRunner:
             steps.append(self._venv_activate_prefix())
             steps.append("python -m pip install --upgrade pip")
         else:
-            steps.append(self._venv_activate_prefix())
+            steps.append(
+                "if [ -f .venv/bin/activate ]; then "
+                f"{self._venv_activate_prefix()}; fi"
+            )
         steps.append(command)
         return " && ".join(steps)
 
@@ -103,7 +106,24 @@ class SandboxRunner:
         return CommandResult(exit_code=process.returncode, stdout=process.stdout, stderr=process.stderr)
 
     def install_dependencies(self, repo_path: Path, install_command: str) -> CommandResult:
-        return self.run(repo_path, install_command, create_venv=True, allow_network=True)
+        normalized = install_command.strip().lower()
+        create_venv = normalized.startswith(
+            (
+                "pip ",
+                "pip3 ",
+                "python -m pip",
+                "python3 -m pip",
+                "poetry ",
+                "uv ",
+                "hatch ",
+            )
+        )
+        return self.run(
+            repo_path,
+            install_command,
+            create_venv=create_venv,
+            allow_network=True,
+        )
 
     def run_tests(self, repo_path: Path, test_command: str) -> CommandResult:
         return self.run(repo_path, test_command, create_venv=False)

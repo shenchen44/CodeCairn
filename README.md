@@ -4,9 +4,15 @@
 
 ---
 
-micro-swe-agent 是一个可本地自托管运行的 AI coding agent MVP。
+micro-swe-agent 是一个可本地自托管、可嵌入和可扩展的通用 Coding Agent
+Runtime。GitHub Issue、SWE-bench 和交互式代码任务会转换为统一
+`CodingTask`，再由 RuntimePolicy 与 Supervisor 选择执行图。
 
-它会监听 GitHub App 的 issue webhook，筛选低风险 issue，在隔离工作目录和 Docker 沙箱中为 Python 仓库生成最小补丁，运行 `pytest`，最多自我修复 3 轮，成功后推送分支、创建 PR、回写 issue 评论，并在 dashboard 中展示 PR、冲突状态和整合操作。
+Runtime 支持 change、review、investigate 和 explain 任务，提供动态工具权限、
+Sandbox、Hybrid Code Retrieval、树状 Session、长短期 Memory、结构化
+Agent hand-off、Evidence Gate、Planner、Patch、Reviewer 和 Evidence Ledger。
+GitHub App 入口可以完成 Issue 接收、隔离修改、测试、重试、创建 PR 和
+Dashboard 管理。
 
 ## Architecture
 

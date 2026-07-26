@@ -68,7 +68,7 @@ def test_process_task_retries_after_tool_failure(sample_issue_payload, workspace
     class FakeAgentLoop:
         calls = 0
 
-        def run(self, toolbox):
+        def run(self, toolbox, retry_context=None):
             type(self).calls += 1
             if type(self).calls == 1:
                 toolbox.dispatch(
@@ -201,7 +201,7 @@ def test_process_task_skips_patch_text_when_tools_already_changed_files(sample_i
             return type("Result", (), {"exit_code": process.returncode, "stdout": process.stdout, "stderr": process.stderr})()
 
     class FakeAgentLoop:
-        def run(self, toolbox):
+        def run(self, toolbox, retry_context=None):
             toolbox.dispatch(
                 "read_file",
                 json.dumps({"path": "app/display.py"}),
@@ -310,7 +310,7 @@ def test_process_task_preserves_diff_and_test_log_on_final_json_parse_failure(sa
     class FakeAgentLoop:
         calls = 0
 
-        def run(self, toolbox):
+        def run(self, toolbox, retry_context=None):
             type(self).calls += 1
             toolbox.dispatch(
                 "write_file",
@@ -485,7 +485,7 @@ def test_process_task_accepts_string_summary_and_pr_body_summary(sample_issue_pa
             return type("Result", (), {"exit_code": process.returncode, "stdout": process.stdout, "stderr": process.stderr})()
 
     class FakeAgentLoop:
-        def run(self, toolbox):
+        def run(self, toolbox, retry_context=None):
             toolbox.dispatch(
                 "write_file",
                 json.dumps(
@@ -566,7 +566,7 @@ def test_process_task_marks_failed_when_pr_stage_errors_after_tests_pass(sample_
             return type("Result", (), {"exit_code": process.returncode, "stdout": process.stdout, "stderr": process.stderr})()
 
     class FakeAgentLoop:
-        def run(self, toolbox):
+        def run(self, toolbox, retry_context=None):
             toolbox.dispatch(
                 "write_file",
                 json.dumps(
@@ -653,7 +653,7 @@ def test_process_task_marks_failed_when_push_fails_after_tests_pass(sample_issue
             return type("Result", (), {"exit_code": process.returncode, "stdout": process.stdout, "stderr": process.stderr})()
 
     class FakeAgentLoop:
-        def run(self, toolbox):
+        def run(self, toolbox, retry_context=None):
             toolbox.dispatch(
                 "write_file",
                 json.dumps(
@@ -775,7 +775,7 @@ def test_process_task_passes_integration_context_to_agent(sample_issue_payload, 
             return type("Result", (), {"exit_code": process.returncode, "stdout": process.stdout, "stderr": process.stderr})()
 
     class FakeAgentLoop:
-        def run(self, toolbox):
+        def run(self, toolbox, retry_context=None):
             issue_context = toolbox.get_issue_context()
             assert issue_context["mode"] == "integration"
             assert issue_context["default_branch"] == "main"
@@ -904,7 +904,7 @@ def test_conflict_resolution_task_marks_original_pr_superseded(sample_issue_payl
             return type("Result", (), {"exit_code": process.returncode, "stdout": process.stdout, "stderr": process.stderr})()
 
     class FakeAgentLoop:
-        def run(self, toolbox):
+        def run(self, toolbox, retry_context=None):
             toolbox.dispatch("read_file", json.dumps({"path": "app/display.py"}))
             toolbox.dispatch(
                 "write_file",

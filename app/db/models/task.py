@@ -39,6 +39,7 @@ class TaskArtifactType(str, enum.Enum):
     install_log = "install_log"
     test_log = "test_log"
     pr_body = "pr_body"
+    agent_phase = "agent_phase"
 
 
 class Task(Base):
