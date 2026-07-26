@@ -11,6 +11,21 @@ Sandbox 中修改与验证仓库，成功后创建 PR。Runtime 也支持 SWE-be
 adapter、只读 review、investigate、explain、多轮 Session、动态工具和
 非 GitHub 调用。
 
+## 交互式 Coding
+
+安装 CodeCairn 后，进入任意 Git 仓库即可启动终端 Agent：
+
+```bash
+python -m pip install -e .
+cd /path/to/repository
+cairn
+```
+
+普通输入默认执行 change 任务；`/review`、`/investigate` 和 `/explain`
+只开放只读工具。`/diff`、`/test`、`/undo`、`/clear` 和 `/status`
+用于管理当前工作区与持久化 Session。Session 数据保存在用户目录，不会写入
+目标仓库。
+
 ## 当前功能
 
 - **Tool-calling agent loop**：支持 `list_files`、`search_code`、`read_file`、`write_file`、`apply_patch`、`run_tests`
@@ -29,7 +44,14 @@ adapter、只读 review、investigate、explain、多轮 Session、动态工具�
 
 ## 推荐使用方式
 
-- 直接在本地仓库运行通用任务：
+- 在本地仓库启动多轮 Coding Session：
+
+```bash
+cd /path/to/repository
+cairn
+```
+
+- 在自动化场景中执行一次性通用任务：
 
 ```bash
 cairn run \

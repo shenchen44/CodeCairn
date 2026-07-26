@@ -14,6 +14,19 @@ Agent hand-off、Evidence Gate、Planner、Patch、Reviewer 和 Evidence Ledger�
 GitHub App 入口可以完成 Issue 接收、隔离修改、测试、重试、创建 PR 和
 Dashboard 管理。
 
+## Interactive Coding
+
+安装后，在任意 Git 仓库中直接运行：
+
+```bash
+cd /path/to/repository
+cairn
+```
+
+终端会进入多轮 Coding Session。普通输入默认执行 change 任务，也可以使用
+`/review`、`/investigate`、`/explain`、`/diff`、`/test`、`/undo`、
+`/clear` 和 `/status`。Session 自动持久化到用户目录，不会污染目标仓库。
+
 ## Architecture
 
 ```
@@ -45,7 +58,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 python -m app.workers.poller
 ```
 
-安装后可以直接对本地仓库运行通用 Coding Task：
+自动化场景仍可执行一次性 Coding Task：
 
 ```bash
 cairn run \

@@ -10,6 +10,21 @@ The included GitHub App is one product surface. The runtime also supports a
 SWE-bench adapter, read-only review, investigation, explanation, persistent
 multi-turn sessions, dynamic tools, and non-GitHub callers.
 
+## Interactive Coding
+
+Install CodeCairn, enter any Git repository, and launch the terminal agent:
+
+```bash
+python -m pip install -e .
+cd /path/to/repository
+cairn
+```
+
+Plain prompts run change tasks by default. `/review`, `/investigate`, and
+`/explain` use read-only tools. `/diff`, `/test`, `/undo`, `/clear`, and
+`/status` manage the active workspace and persistent session. Session data is
+stored under the user's home directory rather than inside the target repository.
+
 ## Features
 
 - **Tool-calling agent loop**: supports `list_files`, `search_code`, `read_file`, `write_file`, `apply_patch`, `run_tests`
@@ -28,7 +43,14 @@ multi-turn sessions, dynamic tools, and non-GitHub callers.
 
 ## Recommended Usage
 
-- Run a source-independent task directly on a local repository:
+- Start an interactive multi-turn coding session:
+
+```bash
+cd /path/to/repository
+cairn
+```
+
+- Run a source-independent one-shot task for automation:
 
 ```bash
 cairn run \

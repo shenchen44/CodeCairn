@@ -14,6 +14,12 @@ from app.services.sandbox.git_ops import diff
 from app.services.sandbox.repo_config import load_repo_config
 from app.services.sandbox.runner import SandboxRunner
 from codecairn import __version__
+from codecairn.interactive import (
+    InteractiveShell,
+    default_session_path,
+    load_session,
+    resolve_repository,
+)
 
 
 def _load_task(args: argparse.Namespace) -> CodingTask:
@@ -31,7 +37,7 @@ def _load_task(args: argparse.Namespace) -> CodingTask:
 
 
 def _run(args: argparse.Namespace) -> int:
-    repo_path = Path(args.repo).expanduser().resolve()
+    repo_path = resolve_repository(Path(args.repo))
     task = _load_task(args)
     session_path = (
         Path(args.session_file).expanduser().resolve()
@@ -74,15 +80,61 @@ def _run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_interactive_options(
+    parser: argparse.ArgumentParser,
+) -> None:
+    parser.add_argument(
+        "--repo",
+        default=".",
+        help="Repository path (default: current directory)",
+    )
+    parser.add_argument(
+        "--variant",
+        choices=["legacy", "retrieval", "memory", "full"],
+        default="full",
+    )
+    parser.add_argument(
+        "--session-file",
+        help="Persistent JSONL session path",
+    )
+
+
+def _chat(args: argparse.Namespace) -> int:
+    repo_path = resolve_repository(Path(args.repo))
+    session_path = (
+        Path(args.session_file).expanduser().resolve()
+        if args.session_file
+        else default_session_path(repo_path)
+    )
+    session = load_session(session_path)
+    policy = get_runtime_policy(args.variant)
+    return InteractiveShell(
+        repo_path=repo_path,
+        policy=policy,
+        session=session,
+    ).run()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cairn",
         description="CodeCairn general-purpose coding agent",
     )
-    parser.add_argument("--version", action="version", version=f"CodeCairn {__version__}")
-    commands = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"CodeCairn {__version__}",
+    )
+    _add_interactive_options(parser)
+    commands = parser.add_subparsers(dest="command")
+    chat = commands.add_parser(
+        "chat",
+        help="Start an interactive coding session",
+    )
+    _add_interactive_options(chat)
+    chat.set_defaults(handler=_chat)
     run = commands.add_parser("run", help="Run a coding task on a local repository")
-    run.add_argument("--repo", required=True)
+    run.add_argument("--repo", default=".")
     run.add_argument("--objective")
     run.add_argument("--description")
     run.add_argument("--task-file")
@@ -103,7 +155,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return args.handler(args)
+    handler = getattr(args, "handler", _chat)
+    return handler(args)
 
 
 if __name__ == "__main__":

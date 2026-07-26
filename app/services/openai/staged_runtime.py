@@ -8,6 +8,7 @@ from pydantic import BaseModel, ValidationError
 from app.services.agent_runtime import (
     AgentSession,
     CodingTask,
+    ExtensionManager,
     normalize_task,
 )
 from app.core.config import get_settings
@@ -676,6 +677,8 @@ class StagedAgentRuntime:
         self,
         client: OpenAIChatClient | None = None,
         policy: RuntimePolicy | None = None,
+        *,
+        extensions: ExtensionManager | None = None,
     ) -> None:
         self.client = client or OpenAIChatClient()
         if policy is None:
@@ -684,7 +687,10 @@ class StagedAgentRuntime:
             )
         self.policy = policy
         self.localization_loop = LocalizationLoop(self.client)
-        self.patch_loop = AgentLoop(self.client)
+        self.patch_loop = AgentLoop(
+            self.client,
+            extensions=extensions,
+        )
 
     def run(
         self,
