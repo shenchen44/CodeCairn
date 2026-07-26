@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,7 @@ from app.services.openai.agent_loop import AgentRunResult
 from app.services.openai.policy import RuntimePolicy
 from app.services.openai.staged_runtime import StagedAgentRuntime
 from app.services.openai.tools import AgentToolbox
+from app.services.orchestration.contracts import RuntimeEvent
 from app.services.sandbox.git_ops import diff
 from app.services.sandbox.repo_config import load_repo_config
 from app.services.sandbox.runner import SandboxRunner
@@ -149,22 +151,87 @@ class UndoRecord:
             raise RuntimeError("workspace_undo_verification_failed")
 
 
-class TerminalProgressExtension:
-    def __init__(self, output: TextIO) -> None:
-        self.output = output
+class TerminalTaskDisplay:
+    PHASE_LABELS = {
+        "task": "Working on the task",
+        "localization": "Inspecting the repository",
+        "planning": "Planning the change",
+        "patch": "Editing the workspace",
+        "patch_minimal": "Building a minimal patch",
+        "patch_challenger": "Checking an alternative patch",
+        "patch_selector": "Selecting the stronger patch",
+        "patch_recovery": "Repairing the patch",
+        "evidence": "Checking implementation evidence",
+        "review": "Reviewing the result",
+    }
+    TOOL_LABELS = {
+        "list_files": "Listing files",
+        "glob_file_search": "Finding files",
+        "search_code": "Searching code",
+        "retrieve_code": "Retrieving relevant code",
+        "read_file": "Reading",
+        "find_definition": "Finding definition",
+        "get_imports": "Inspecting imports",
+        "get_functions": "Inspecting symbols",
+        "git_log": "Reading Git history",
+        "git_blame": "Tracing code history",
+        "write_file": "Updating",
+        "replace_in_file": "Updating",
+        "replace_in_files": "Updating files",
+        "apply_patch": "Applying patch",
+        "git_diff": "Checking the diff",
+        "run_test_file": "Running targeted tests",
+        "run_tests": "Running tests",
+        "run_command": "Running command",
+    }
 
-    def on_event(
+    def __init__(
         self,
-        event: ExtensionEvent,
-    ) -> ExtensionResult | None:
+        output: TextIO,
+        style: Callable[[str, str], str],
+    ) -> None:
+        self.output = output
+        self.style = style
+        self._last_tool: tuple[str, str] | None = None
+
+    def on_runtime_event(self, event: RuntimeEvent) -> None:
+        if event.event_type == "runtime_start":
+            self._write_status("Understanding the task")
+            return
+        if event.event_type != "phase_start":
+            return
+        phase = str(event.phase or "working")
+        label = self.PHASE_LABELS.get(
+            phase,
+            phase.replace("_", " ").title(),
+        )
+        self._write_status(label)
+
+    def on_tool_event(self, event: ExtensionEvent) -> None:
         if event.name != "tool_call":
-            return None
+            return
         name = str(event.payload.get("name") or "tool")
         detail = self._tool_detail(event.payload.get("arguments"))
+        signature = (name, detail)
+        if signature == self._last_tool:
+            return
+        self._last_tool = signature
+        label = self.TOOL_LABELS.get(
+            name,
+            name.replace("_", " ").title(),
+        )
         suffix = f" {detail}" if detail else ""
-        self.output.write(f"  [{event.turn or '-'}] {name}{suffix}\n")
+        branch = self.style("└─", "muted")
+        text = self.style(f"{label}{suffix}", "muted")
+        self.output.write(f"  {branch} {text}\n")
         self.output.flush()
-        return None
+
+    def _write_status(self, label: str) -> None:
+        marker = self.style("*", "warning")
+        text = self.style(f"{label}...", "warning")
+        self.output.write(f"\n{marker} {text}\n")
+        self.output.flush()
+        self._last_tool = None
 
     @staticmethod
     def _tool_detail(arguments: object) -> str:
@@ -178,6 +245,18 @@ class TerminalProgressExtension:
                 compact = " ".join(str(value).split())
                 return compact[:100]
         return ""
+
+
+class TerminalProgressExtension:
+    def __init__(self, display: TerminalTaskDisplay) -> None:
+        self.display = display
+
+    def on_event(
+        self,
+        event: ExtensionEvent,
+    ) -> ExtensionResult | None:
+        self.display.on_tool_event(event)
+        return None
 
 
 TaskExecutor = Callable[[CodingTask, AgentSession], AgentRunResult]
@@ -215,19 +294,28 @@ class InteractiveShell:
             else None
         )
         self._prompt_style = Style.from_dict(
-            {"prompt": "ansicyan bold" if self.color else ""}
+            {
+                "prompt": "ansiwhite bold" if self.color else "",
+                "border": "ansibrightblack" if self.color else "",
+                "bottom-toolbar": "noreverse",
+            }
         )
         self.default_intent = TaskIntent.change
         self.undo_stack: list[UndoRecord] = []
         self.repo_config = load_repo_config(repo_path)
         self.sandbox_runner = SandboxRunner()
         self._task_executor = task_executor
+        self.task_display = TerminalTaskDisplay(
+            output,
+            self._style,
+        )
         extensions = ExtensionManager(
-            [TerminalProgressExtension(output)]
+            [TerminalProgressExtension(self.task_display)]
         )
         self.runtime = StagedAgentRuntime(
             policy=policy,
             extensions=extensions,
+            event_sink=self.task_display.on_runtime_event,
         )
 
     def run(self) -> int:
@@ -251,8 +339,21 @@ class InteractiveShell:
 
     def _read_input(self) -> str:
         if self._prompt_session is not None:
+            border = "─" * max(
+                20,
+                shutil.get_terminal_size(fallback=(88, 24)).columns - 1,
+            )
             return self._prompt_session.prompt(
-                FormattedText([("class:prompt", "> ")]),
+                FormattedText(
+                    [
+                        ("class:border", border),
+                        ("", "\n"),
+                        ("class:prompt", "❯ "),
+                    ]
+                ),
+                bottom_toolbar=FormattedText(
+                    [("class:border", border)]
+                ),
                 style=self._prompt_style,
             )
         return self.input_fn("> ")
@@ -299,14 +400,13 @@ class InteractiveShell:
     def _execute(self, objective: str, intent: TaskIntent) -> None:
         before = WorkspaceTree.capture(self.repo_path)
         task = interactive_task(objective, intent=intent)
-        self._write(f"Running {intent.value} task...\n")
         result: AgentRunResult | None = None
         try:
             result = self._execute_task(task)
         except KeyboardInterrupt:
-            self._write("\nTask interrupted.\n")
+            self._render_error("Task interrupted")
         except Exception as exc:
-            self._write(f"Task failed: {exc}\n")
+            self._render_error(self._error_message(exc))
         finally:
             after = WorkspaceTree.capture(self.repo_path)
             if after != before:
@@ -321,6 +421,19 @@ class InteractiveShell:
                 self._write("Workspace changed. Use /diff or /undo.\n")
         if result is not None:
             self._render_result(result)
+
+    def _render_error(self, message: str) -> None:
+        branch = self._style("└─", "muted")
+        label = self._style("Error:", "error")
+        detail = self._style(message, "error")
+        self._write(f"\n  {branch} {label} {detail}\n")
+
+    @staticmethod
+    def _error_message(exc: Exception) -> str:
+        message = " ".join(str(exc).split())
+        if not message:
+            message = exc.__class__.__name__
+        return message[:2000]
 
     def _execute_task(self, task: CodingTask) -> AgentRunResult:
         if self._task_executor is not None:
@@ -529,6 +642,8 @@ class InteractiveShell:
             "bold": "\033[1;97m",
             "accent": "\033[38;5;37m",
             "muted": "\033[38;5;244m",
+            "warning": "\033[38;5;209m",
+            "error": "\033[38;5;203m",
         }
         return f"{codes.get(role, '')}{text}\033[0m"
 

@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import time
+from collections.abc import Callable
 
 from pydantic import BaseModel, ValidationError
 
@@ -43,7 +44,7 @@ from app.services.orchestration import (
     build_evidence_ledger,
     compile_agent_graph,
 )
-from app.services.orchestration.contracts import AgentGraph
+from app.services.orchestration.contracts import AgentGraph, RuntimeEvent
 
 
 logger = logging.getLogger(__name__)
@@ -679,6 +680,7 @@ class StagedAgentRuntime:
         policy: RuntimePolicy | None = None,
         *,
         extensions: ExtensionManager | None = None,
+        event_sink: Callable[[RuntimeEvent], None] | None = None,
     ) -> None:
         self.client = client or OpenAIChatClient()
         if policy is None:
@@ -686,6 +688,7 @@ class StagedAgentRuntime:
                 get_settings().agent_runtime_variant
             )
         self.policy = policy
+        self.event_sink = event_sink
         self.localization_loop = LocalizationLoop(self.client)
         self.patch_loop = AgentLoop(
             self.client,
@@ -702,7 +705,7 @@ class StagedAgentRuntime:
         if task is None:
             task = normalize_task(toolbox.get_issue_context())
         issue_context = task.prompt_payload()
-        events = RuntimeEventRecorder()
+        events = RuntimeEventRecorder(self.event_sink)
         baseline_diff = ""
         if task.requires_workspace_change:
             baseline_diff = str(

@@ -4,13 +4,20 @@ from pathlib import Path
 
 import pytest
 
-from app.services.agent_runtime import AgentSession, TaskIntent
+from app.services.agent_runtime import (
+    AgentSession,
+    CodingTask,
+    ExtensionEvent,
+    TaskIntent,
+)
 from app.services.openai.agent_loop import AgentRunResult
 from app.services.openai.policy import get_runtime_policy
+from app.services.orchestration.contracts import RuntimeEvent
 from codecairn import __version__
 from codecairn.cli import build_parser, main
 from codecairn.interactive import (
     InteractiveShell,
+    TerminalTaskDisplay,
     UndoRecord,
     WorkspaceTree,
     default_session_path,
@@ -198,3 +205,66 @@ def test_repository_resolution_and_session_path_are_stable(tmp_path):
     assert root == tmp_path.resolve()
     assert default_session_path(root) == default_session_path(root)
     assert default_session_path(root).suffix == ".jsonl"
+
+
+def test_terminal_task_display_formats_runtime_and_tool_progress():
+    output = io.StringIO()
+    display = TerminalTaskDisplay(output, lambda text, _: text)
+    task = CodingTask(objective="Fix the cache")
+
+    display.on_runtime_event(
+        RuntimeEvent(
+            sequence=1,
+            event_type="runtime_start",
+            payload={},
+            elapsed_ms=0,
+        )
+    )
+    display.on_runtime_event(
+        RuntimeEvent(
+            sequence=2,
+            event_type="phase_start",
+            phase="localization",
+            payload={},
+            elapsed_ms=1,
+        )
+    )
+    display.on_tool_event(
+        ExtensionEvent(
+            name="tool_call",
+            task=task,
+            turn=1,
+            payload={
+                "name": "read_file",
+                "arguments": '{"path":"app/cache.py"}',
+            },
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "* Understanding the task..." in rendered
+    assert "* Inspecting the repository..." in rendered
+    assert "└─ Reading app/cache.py" in rendered
+
+
+def test_interactive_shell_formats_errors_as_terminal_block(tmp_path):
+    _init_repo(tmp_path)
+    output = io.StringIO()
+    commands = iter(["trigger an API error", "/exit"])
+
+    def fail_task(task, session):
+        raise RuntimeError("API Error: 402 Insufficient Balance")
+
+    shell = InteractiveShell(
+        repo_path=tmp_path,
+        policy=get_runtime_policy("full"),
+        session=AgentSession(path=tmp_path / "session.jsonl"),
+        input_fn=lambda _: next(commands),
+        output=output,
+        task_executor=fail_task,
+    )
+
+    assert shell.run() == 0
+    rendered = output.getvalue()
+    assert "└─ Error: API Error: 402 Insufficient Balance" in rendered
+    assert "Task failed:" not in rendered
