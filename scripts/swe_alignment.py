@@ -56,7 +56,7 @@ def cmd_rollout_summary(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="SWE-style alignment utilities for micro-swe-agent")
+    parser = argparse.ArgumentParser(description="SWE-style alignment utilities for CodeCairn")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     make_sft = subparsers.add_parser("make-sft", help="Generate completion SFT records from SWE-bench-like instances")

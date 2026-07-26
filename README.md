@@ -1,10 +1,10 @@
-# micro-swe-agent
+# CodeCairn
 
 **[🇺🇸 English](README-en.md)** | **[🇨🇳 中文](README-zh.md)**
 
 ---
 
-micro-swe-agent 是一个可本地自托管、可嵌入和可扩展的通用 Coding Agent
+CodeCairn 是一个可本地自托管、可嵌入和可扩展的通用 Coding Agent
 Runtime。GitHub Issue、SWE-bench 和交互式代码任务会转换为统一
 `CodingTask`，再由 RuntimePolicy 与 Supervisor 选择执行图。
 
@@ -36,13 +36,22 @@ docker compose exec api alembic upgrade head
 ### Local Python
 
 ```bash
-python -m pip install -r requirements.txt
+python -m pip install -e .
 cp .env.example .env
 alembic upgrade head
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 # In another terminal
 python -m app.workers.poller
+```
+
+安装后可以直接对本地仓库运行通用 Coding Task：
+
+```bash
+cairn run \
+  --repo /path/to/repository \
+  --intent change \
+  --objective "修复缓存失效并运行相关测试"
 ```
 
 ## Full Documentation

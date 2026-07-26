@@ -74,11 +74,11 @@ Defined in `app/services/task_runner/state_machine.py`.
 - `Issue`, `Repository`: Linked to tasks
 
 ### Environment Variables
-- `DATABASE_URL`: PostgreSQL connection (default: `postgresql+psycopg://postgres:postgres@localhost:5432/micro_swe_agent`)
+- `DATABASE_URL`: PostgreSQL connection (default: `postgresql+psycopg://postgres:postgres@localhost:5432/codecairn`)
 - `OPENAI_API_KEY`, `OPENAI_MODEL`: OpenAI configuration
 - `GITHUB_APP_ID`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_PRIVATE_KEY_PATH`: GitHub App credentials
 - `GITHUB_TARGET_LABELS`: Comma-separated labels to process (default: `good first issue,bug,agent-fixable`)
-- `WORKSPACE_ROOT`: Temp directory for repo clones (default: `/tmp/micro-swe-agent`)
+- `WORKSPACE_ROOT`: Temp directory for repo clones (default: `/tmp/codecairn`)
 - `DOCKER_BIND_HOST_ROOT`, `DOCKER_BIND_CONTAINER_ROOT`: Path mapping for sandbox Docker mounts
 - `max_attempts`: Max patch→test→retry cycles (default: 3)
 

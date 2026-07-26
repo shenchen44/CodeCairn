@@ -605,13 +605,13 @@ def run_instance(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate SWE-bench Lite prediction patches with micro-swe-agent")
+    parser = argparse.ArgumentParser(description="Generate SWE-bench Lite prediction patches with CodeCairn")
     parser.add_argument("--instances", required=True, help="SWE-bench Lite JSONL fetched by scripts/fetch_swebench_lite.py")
     parser.add_argument("--predictions", required=True, help="Official SWE-bench predictions JSONL output")
     parser.add_argument("--rollouts", required=True, help="Detailed rollout JSONL output")
     parser.add_argument("--cache-dir", default=".cache/swebench/repos")
     parser.add_argument("--workspace-dir", default=".workspaces/swebench_lite")
-    parser.add_argument("--model-name", default="micro-swe-agent")
+    parser.add_argument("--model-name", default="codecairn")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--resume", action="store_true", help="Skip instances already present in the rollout file")

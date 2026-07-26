@@ -1,6 +1,6 @@
-# micro-swe-agent
+# CodeCairn
 
-项目的核心定位是可嵌入、可扩展的通用 Coding Agent Runtime。核心只理解
+CodeCairn 的核心定位是可嵌入、可扩展的通用 Coding Agent Runtime。核心只理解
 `CodingTask`、会话、工具、模型和生命周期事件；GitHub Issue、SWE-bench、
 交互式调用和自动化任务通过 adapter 接入。`full` Runtime 还提供声明式
 AgentGraph、EvidenceLedger、隔离 worktree 候选补丁和通用失败恢复。架构见
@@ -32,7 +32,7 @@ adapter、只读 review、investigate、explain、多轮 Session、动态工具�
 - 直接在本地仓库运行通用任务：
 
 ```bash
-python scripts/run_coding_task.py \
+cairn run \
   --repo /path/to/repository \
   --intent review \
   --objective "审查缓存模块的并发与失效策略" \
@@ -260,7 +260,7 @@ docker compose logs -f worker
 1. **安装依赖并复制环境变量**
 
 ```bash
-python -m pip install -r requirements.txt
+python -m pip install -e .
 cp .env.example .env
 ```
 
@@ -269,7 +269,7 @@ cp .env.example .env
 例如：
 
 ```text
-GITHUB_PRIVATE_KEY_PATH=/Users/yourname/Desktop/micro-swe-agent/secrets/<your-private-key>.pem
+GITHUB_PRIVATE_KEY_PATH=/Users/yourname/Desktop/codecairn/secrets/<your-private-key>.pem
 ```
 
 3. **执行迁移并启动**

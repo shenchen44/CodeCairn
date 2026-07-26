@@ -1,1 +1,1 @@
-"""micro-swe-agent application package."""
+"""CodeCairn application internals."""

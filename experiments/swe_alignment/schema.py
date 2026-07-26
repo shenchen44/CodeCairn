@@ -28,7 +28,7 @@ class SWEInstance:
     """A SWE-bench-like code-fixing task.
 
     The class accepts both real SWE-bench records and the small local benchmark
-    fixtures used by micro-swe-agent.
+    fixtures used by CodeCairn.
     """
 
     instance_id: str

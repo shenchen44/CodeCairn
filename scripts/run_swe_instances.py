@@ -359,7 +359,7 @@ def run_instance(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run micro-swe-agent on local SWE-style instances")
+    parser = argparse.ArgumentParser(description="Run CodeCairn on local SWE-style instances")
     parser.add_argument("--instances", required=True, help="SWE-bench-like JSON or JSONL with repo_path/repo_fixture")
     parser.add_argument("--output", required=True, help="JSONL output path")
     parser.add_argument("--limit", type=int, default=None)

@@ -17,7 +17,7 @@ ENV/
 .pytest_cache/
 .pytest_tmp/
 *.db
-test_micro_swe_agent.db
+test_codecairn.db
 
 # Workspaces (temp clone directories)
 .workspaces/
@@ -27,6 +27,7 @@ test_micro_swe_agent.db
 outputs/
 logs/
 data/swe/*.jsonl
+/*.deepseek_*.json
 
 # IDE
 .idea/

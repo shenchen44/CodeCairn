@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     app_env: str = "development"
-    database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5432/micro_swe_agent"
+    database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5432/codecairn"
     openai_api_key: str = ""
     openai_model: str = "gpt-4.1-mini"
     openai_base_url: str | None = None
@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     sandbox_timeout_seconds: int = 300
     sandbox_memory_limit: str = "1g"
     sandbox_cpu_limit: float = 1.0
-    workspace_root: str = "/tmp/micro-swe-agent"
+    workspace_root: str = "/tmp/codecairn"
     docker_bind_host_root: str | None = None
     docker_bind_container_root: str = "/app"
     log_level: str = "INFO"

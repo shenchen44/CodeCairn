@@ -7,7 +7,7 @@ def test_health_returns_meta(client) -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "ok"
-    assert payload["service"] == "micro-swe-agent"
+    assert payload["service"] == "codecairn"
     assert isinstance(payload["version"], str)
     assert payload["environment"] == settings.app_env
     assert isinstance(payload["dashboard_enabled"], bool)

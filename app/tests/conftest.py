@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-os.environ["DATABASE_URL"] = "sqlite:///./test_micro_swe_agent.db"
+os.environ["DATABASE_URL"] = "sqlite:///./test_codecairn.db"
 os.environ.setdefault("GITHUB_WEBHOOK_SECRET", "test-secret")
 os.environ.setdefault("WORKSPACE_ROOT", str(Path.cwd() / ".tmp-test-workspaces"))
 

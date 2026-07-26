@@ -826,7 +826,7 @@ async def process_task(task_id: str) -> None:
                                     task.repository.name,
                                     source_pr_number,
                                     (
-                                        "micro-swe-agent generated a conflict-resolved follow-up PR.\n\n"
+                                        "CodeCairn generated a conflict-resolved follow-up PR.\n\n"
                                         f"- Original PR: #{source_pr_number}\n"
                                         f"- Replacement PR: {pr['html_url']}\n"
                                         "- Please review and merge the replacement PR instead of this conflicted one.\n"

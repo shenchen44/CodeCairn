@@ -158,8 +158,8 @@ def _filter_committable_paths(paths: list[str]) -> list[str]:
 
 
 def commit_all(repo_path: Path, message: str, include_paths: list[str] | None = None) -> str:
-    run_git(repo_path, "config", "user.email", "micro-swe-agent@users.noreply.github.com")
-    run_git(repo_path, "config", "user.name", "micro-swe-agent")
+    run_git(repo_path, "config", "user.email", "codecairn@users.noreply.github.com")
+    run_git(repo_path, "config", "user.name", "CodeCairn")
     run_git(repo_path, "restore", "--staged", ".")
     paths_to_stage = _filter_committable_paths(include_paths or [])
     if not paths_to_stage:

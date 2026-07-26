@@ -1,1 +1,1 @@
-"""Offline experiments for micro-swe-agent."""
+"""Offline experiments for CodeCairn."""

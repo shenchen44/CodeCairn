@@ -59,7 +59,7 @@ def main() -> None:
     parser.add_argument("--target-attempts", type=int, default=100)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--per-instance-timeout", type=int, default=150)
-    parser.add_argument("--model-name", default="micro-swe-agent")
+    parser.add_argument("--model-name", default="codecairn")
     parser.add_argument("--cache-dir", default=".cache/swebench/repos")
     parser.add_argument("--workspace-dir", default=".workspaces/swebench_lite")
     parser.add_argument("--variant", choices=["legacy", "retrieval", "memory", "full"], default=None)

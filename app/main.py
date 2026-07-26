@@ -7,11 +7,12 @@ from app.api.routes.repositories import router as repositories_router
 from app.api.routes.tasks import router as tasks_router
 from app.core.logging import configure_logging
 from app.db.session import init_db
+from codecairn import __version__
 
 
 configure_logging()
 
-app = FastAPI(title="micro-swe-agent", version="0.1.2")
+app = FastAPI(title="CodeCairn", version=__version__)
 
 
 @app.on_event("startup")

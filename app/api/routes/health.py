@@ -12,7 +12,7 @@ def health() -> dict:
     settings = get_settings()
     return {
         "status": "ok",
-        "service": "micro-swe-agent",
+        "service": "codecairn",
         "version": app.version,
         "environment": settings.app_env,
         "dashboard_enabled": settings.dashboard_enabled,

@@ -1,6 +1,6 @@
-# micro-swe-agent
+# CodeCairn
 
-The project is an embeddable, extensible general-purpose coding agent runtime.
+CodeCairn is an embeddable, extensible general-purpose coding agent runtime.
 Its core understands source-independent coding tasks, sessions, tools, models,
 and lifecycle events. GitHub Issues, SWE-bench, interactive clients, and
 automations connect through adapters. See
@@ -31,7 +31,7 @@ multi-turn sessions, dynamic tools, and non-GitHub callers.
 - Run a source-independent task directly on a local repository:
 
 ```bash
-python scripts/run_coding_task.py \
+cairn run \
   --repo /path/to/repository \
   --intent review \
   --objective "Review cache concurrency and invalidation" \
@@ -255,7 +255,7 @@ docker compose logs -f worker
 1. **Install dependencies and copy environment file**
 
 ```bash
-python -m pip install -r requirements.txt
+python -m pip install -e .
 cp .env.example .env
 ```
 
@@ -264,7 +264,7 @@ cp .env.example .env
 For example:
 
 ```text
-GITHUB_PRIVATE_KEY_PATH=/Users/yourname/Desktop/micro-swe-agent/secrets/<your-private-key>.pem
+GITHUB_PRIVATE_KEY_PATH=/Users/yourname/Desktop/codecairn/secrets/<your-private-key>.pem
 ```
 
 3. **Run migrations and start**
