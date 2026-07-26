@@ -158,11 +158,17 @@ def test_interactive_shell_runs_multiturn_command_and_undo(tmp_path):
             pr_body_summary={},
         )
 
+    prompts: list[str] = []
+
+    def read_input(prompt):
+        prompts.append(prompt)
+        return next(commands)
+
     shell = InteractiveShell(
         repo_path=tmp_path,
         policy=get_runtime_policy("full"),
         session=AgentSession(path=tmp_path / "session.jsonl"),
-        input_fn=lambda _: next(commands),
+        input_fn=read_input,
         output=output,
         task_executor=execute,
     )
@@ -179,6 +185,7 @@ def test_interactive_shell_runs_multiturn_command_and_undo(tmp_path):
     assert "\033[" not in rendered
     assert "Workspace changed. Use /diff or /undo." in rendered
     assert "Undid: change the value" in rendered
+    assert prompts == ["> ", "> ", "> ", "> "]
 
 
 def test_repository_resolution_and_session_path_are_stable(tmp_path):

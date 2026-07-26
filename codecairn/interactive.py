@@ -10,6 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, TextIO
 
+from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.styles import Style
+
 from app.services.adapters import interactive_task
 from app.services.agent_runtime import (
     AgentSession,
@@ -199,6 +204,19 @@ class InteractiveShell:
             and not os.environ.get("NO_COLOR")
             and os.environ.get("TERM") != "dumb"
         )
+        self._interactive_input = (
+            input_fn is input
+            and sys.stdin.isatty()
+            and bool(getattr(output, "isatty", lambda: False)())
+        )
+        self._prompt_session: PromptSession | None = (
+            PromptSession(history=InMemoryHistory())
+            if self._interactive_input
+            else None
+        )
+        self._prompt_style = Style.from_dict(
+            {"prompt": "ansicyan bold" if self.color else ""}
+        )
         self.default_intent = TaskIntent.change
         self.undo_stack: list[UndoRecord] = []
         self.repo_config = load_repo_config(repo_path)
@@ -216,9 +234,7 @@ class InteractiveShell:
         self._show_banner()
         while True:
             try:
-                line = self.input_fn(
-                    self._style("> ", "accent")
-                ).strip()
+                line = self._read_input().strip()
             except EOFError:
                 self._write("\n")
                 return 0
@@ -232,6 +248,14 @@ class InteractiveShell:
                     return 0
                 continue
             self._execute(line, self.default_intent)
+
+    def _read_input(self) -> str:
+        if self._prompt_session is not None:
+            return self._prompt_session.prompt(
+                FormattedText([("class:prompt", "> ")]),
+                style=self._prompt_style,
+            )
+        return self.input_fn("> ")
 
     def _handle_command(self, line: str) -> bool:
         command, _, argument = line.partition(" ")
