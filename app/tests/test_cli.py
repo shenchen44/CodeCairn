@@ -172,8 +172,10 @@ def test_interactive_shell_runs_multiturn_command_and_undo(tmp_path):
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "value = 1\n"
     rendered = output.getvalue()
     assert f"CodeCairn v{__version__}" in rendered
-    assert "Sandbox:" in rendered
-    assert "Session:" in rendered
+    assert str(tmp_path) in rendered
+    assert "Natural-language tasks are ready" not in rendered
+    assert "Sandbox:" not in rendered
+    assert "Session:" not in rendered
     assert "\033[" not in rendered
     assert "Workspace changed. Use /diff or /undo." in rendered
     assert "Undid: change the value" in rendered

@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -218,7 +217,7 @@ class InteractiveShell:
         while True:
             try:
                 line = self.input_fn(
-                    f"cairn[{self.default_intent.value}]> "
+                    self._style("> ", "accent")
                 ).strip()
             except EOFError:
                 self._write("\n")
@@ -374,52 +373,25 @@ class InteractiveShell:
 
     def _show_banner(self) -> None:
         settings = get_settings()
-        branch = self._branch_label()
         path = self._display_path(self.repo_path)
-        session = (
-            self._display_path(self.session.path)
-            if self.session.path
-            else self.session.session_id
-        )
-        width = max(
-            56,
-            min(shutil.get_terminal_size(fallback=(88, 24)).columns, 110),
-        )
         logo = [
-            "       .----.",
-            "      /______\\",
-            "        .--.",
-            "      _/____\\_",
-            "     /________\\",
+            "       ▄▄▄",
+            "     ▄█████▄",
+            "   ▄█████████▄",
         ]
         info = [
             self._style(
                 f"CodeCairn v{__version__}",
                 "bold",
             ),
-            (
-                f"{settings.openai_model}  |  "
-                f"{settings.openai_provider}  |  {self.policy.name}"
-            ),
-            f"{path}  |  {branch}  |  {self.repo_config.language}",
-            (
-                f"Sandbox: {settings.sandbox_base_image}  |  "
-                f"Mode: {self.default_intent.value}"
-            ),
-            f"Session: {session}",
+            settings.openai_model,
+            path,
         ]
         self._write("\n")
         for index, line in enumerate(info):
             mark = self._style(logo[index], "accent")
             self._write(f"{mark}    {line}\n")
-        self._write(self._style("-" * width, "muted") + "\n")
-        self._write(
-            self._style(
-                "Natural-language tasks are ready. /help lists commands.",
-                "muted",
-            )
-            + "\n\n"
-        )
+        self._write("\n")
 
     def _show_status(self) -> None:
         settings = get_settings()
