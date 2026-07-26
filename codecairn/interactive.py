@@ -295,7 +295,7 @@ class InteractiveShell:
         )
         self._prompt_style = Style.from_dict(
             {
-                "prompt": "ansiwhite bold" if self.color else "",
+                "prompt": "#00afaf bold" if self.color else "",
                 "border": "ansibrightblack" if self.color else "",
                 "bottom-toolbar": "noreverse",
             }
@@ -642,7 +642,7 @@ class InteractiveShell:
             "bold": "\033[1;97m",
             "accent": "\033[38;5;37m",
             "muted": "\033[38;5;244m",
-            "warning": "\033[38;5;209m",
+            "warning": "\033[38;5;37m",
             "error": "\033[38;5;203m",
         }
         return f"{codes.get(role, '')}{text}\033[0m"
