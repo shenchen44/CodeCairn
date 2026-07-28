@@ -1,1 +1,0 @@
-"""CodeCairn application internals."""

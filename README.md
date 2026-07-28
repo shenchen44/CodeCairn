@@ -1,75 +1,21 @@
 # CodeCairn
 
-**[🇺🇸 English](README-en.md)** | **[🇨🇳 中文](README-zh.md)**
+**[English](README-en.md) | [中文](README-zh.md)**
 
----
-
-CodeCairn 是一个可本地自托管、可嵌入和可扩展的通用 Coding Agent
-Runtime。GitHub Issue、SWE-bench 和交互式代码任务会转换为统一
-`CodingTask`，再由 RuntimePolicy 与 Supervisor 选择执行图。
-
-Runtime 支持 change、review、investigate 和 explain 任务，提供动态工具权限、
-Sandbox、Hybrid Code Retrieval、树状 Session、长短期 Memory、结构化
-Agent hand-off、Evidence Gate、Planner、Patch、Reviewer 和 Evidence Ledger。
-GitHub App 入口可以完成 Issue 接收、隔离修改、测试、重试、创建 PR 和
-Dashboard 管理。
-
-## Interactive Coding
-
-安装后，在任意 Git 仓库中直接运行：
-
-```bash
-cd /path/to/repository
-cairn
-```
-
-终端会进入多轮 Coding Session。普通输入默认执行 change 任务，也可以使用
-`/review`、`/investigate`、`/explain`、`/diff`、`/test`、`/undo`、
-`/clear` 和 `/status`。Session 自动持久化到用户目录，不会污染目标仓库。
-
-## Architecture
-
-```
-received -> triaged -> sandbox_ready -> patching -> testing -> retrying -> patching
-testing -> ready_for_pr -> pr_opened -> done
-* -> failed
-```
-
-## Quick Start
-
-### Docker Compose
-
-```bash
-cp .env.example .env
-# Fill in OPENAI_API_KEY, GITHUB_APP_ID, GITHUB_WEBHOOK_SECRET, etc.
-docker compose up --build
-docker compose exec api alembic upgrade head
-```
-
-### Local Python
+CodeCairn is a local-first evidence and review layer for AI-assisted code
+changes. It integrates with Pi to capture implementation decisions, connect
+them to the resulting diff, run bounded verification, and produce a reviewable
+Change Proof.
 
 ```bash
 python -m pip install -e .
-cp .env.example .env
-alembic upgrade head
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-
-# In another terminal
-python -m app.workers.poller
+pi install "$(pwd)/packages/pi-extension"
+cd /path/to/repository
+pi
 ```
 
-自动化场景仍可执行一次性 Coding Task：
+Use `/cairn` in Pi after coding, or run `cairn review` directly in any Git
+repository with local changes.
 
-```bash
-cairn run \
-  --repo /path/to/repository \
-  --intent change \
-  --objective "修复缓存失效并运行相关测试"
-```
-
-## Full Documentation
-
-| Language | File | Description |
-|---|---|---|
-| 🇺🇸 English | [README-en.md](README-en.md) | Full English documentation |
-| 🇨🇳 中文 | [README-zh.md](README-zh.md) | 完整中文文档 |
+See the [English guide](README-en.md), [中文说明](README-zh.md), and
+[product PRD](docs/codecairn_product_prd_zh.md).

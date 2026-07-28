@@ -1,0 +1,52 @@
+name: CodeCairn CI Verification
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install .
+      - name: Build unprivileged observation manifest
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          PR_NUMBER: ${{ github.event.pull_request.number || 1 }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ] || [ "$PR_BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            PR_BASE_SHA="$(git rev-parse HEAD^)"
+          fi
+          WORKFLOW_REF="${GITHUB_WORKFLOW_REF##*@}"
+          cairn ci manifest \
+            --repo . \
+            --base "$PR_BASE_SHA" \
+            --requirement "CodeCairn unprivileged test observation" \
+            --workflow-path ".github/workflows/codecairn-ci.yml" \
+            --workflow-ref "$WORKFLOW_REF" \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --pr-number "$PR_NUMBER" \
+            --output codecairn-ci-manifest.json \
+            --command python -m compileall -q codecairn
+      - name: Run declared verification without signing credentials
+        run: |
+          cairn ci run \
+            --repo . \
+            --manifest codecairn-ci-manifest.json \
+            --output codecairn-ci-result.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: codecairn-ci-result
+          path: codecairn-ci-result.json

@@ -1,7 +1,5 @@
-"""Public package for the CodeCairn coding agent runtime."""
+"""CodeCairn evidence and review infrastructure for AI coding."""
 
-from app.services.agent_runtime import AgentSession, CodingTask, TaskIntent
-
-__all__ = ["AgentSession", "CodingTask", "TaskIntent", "__version__"]
+__all__ = ["__version__"]
 
 __version__ = "0.4.1"

@@ -1,0 +1,29 @@
+{
+  "name": "@codecairn/pi-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Evidence capture and pre-mutation decision gates for Pi",
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "keywords": [
+    "pi-package",
+    "coding-agent",
+    "code-review",
+    "evidence"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/codecairn.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

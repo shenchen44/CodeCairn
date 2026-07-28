@@ -1,0 +1,12 @@
+schema_version = 1
+allowed_repository = "shenchen44/CodeCairn"
+allowed_workflow_paths = [".github/workflows/codecairn-ci.yml"]
+allowed_workflow_refs = ["refs/heads/main"]
+allowed_event_types = ["pull_request"]
+trusted_attestation_issuers = []
+artifact_name = "codecairn-ci-result"
+maximum_result_age_seconds = 86400
+allow_local_manual_signing = false
+
+# Add issuer-scoped public keys only through a reviewed base-branch policy change.
+[public_keys]

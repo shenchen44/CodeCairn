@@ -5,24 +5,19 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "codecairn"
 version = "0.4.1"
-description = "An evidence-driven runtime for general-purpose coding agents"
+description = "Evidence capture and review for AI-assisted code changes"
 readme = "README-en.md"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi==0.115.12",
     "uvicorn[standard]==0.34.0",
-    "sqlalchemy==2.0.39",
-    "alembic==1.15.2",
-    "psycopg[binary]==3.2.6",
     "pydantic==2.11.2",
     "pydantic-settings==2.8.1",
     "httpx==0.28.1",
     "PyJWT==2.10.1",
     "PyYAML==6.0.2",
-    "python-multipart==0.0.20",
-    "openai==1.70.0",
     "cryptography==44.0.2",
-    "prompt-toolkit==3.0.52",
+    "Pillow==11.3.0",
 ]
 
 [project.scripts]
@@ -30,4 +25,4 @@ cairn = "codecairn.cli:main"
 codecairn = "codecairn.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["app*", "codecairn*", "experiments*", "scripts*"]
+include = ["codecairn*"]

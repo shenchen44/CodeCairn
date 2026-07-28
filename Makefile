@@ -1,18 +1,17 @@
-PYTHON ?= python
+PYTHON ?= uv run
 
-.PHONY: install run-api run-worker migrate test fmt
+.PHONY: install test check review
 
 install:
-	$(PYTHON) -m pip install -e .
-
-run-api:
-	uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-
-run-worker:
-	$(PYTHON) -m app.workers.poller
-
-migrate:
-	alembic upgrade head
+	uv sync
+	npm --prefix packages/pi-extension install
 
 test:
-	pytest app/tests -q
+	$(PYTHON) pytest -q
+
+check:
+	$(PYTHON) python -m compileall -q codecairn
+	npm --prefix packages/pi-extension run check
+
+review:
+	$(PYTHON) cairn review

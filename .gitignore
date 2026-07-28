@@ -14,20 +14,17 @@ venv/
 ENV/
 
 # Testing
+/tests/
+pytest.ini
 .pytest_cache/
 .pytest_tmp/
+.test-workspaces/
 *.db
-test_codecairn.db
 
-# Workspaces (temp clone directories)
-.workspaces/
+# Local caches
 .cache/
-
-# Experiment outputs
 outputs/
 logs/
-data/swe/*.jsonl
-/*.deepseek_*.json
 
 # IDE
 .idea/
@@ -43,3 +40,4 @@ Thumbs.db
 *.egg-info/
 dist/
 build/
+node_modules/
