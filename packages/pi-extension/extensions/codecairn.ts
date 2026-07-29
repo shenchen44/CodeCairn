@@ -256,6 +256,17 @@ export default function codecairnExtension(pi: ExtensionAPI): void {
 
   pi.on("before_agent_start", (event, ctx) => {
     record(ctx, "task_submitted", { prompt: event.prompt });
+    if (process.env.CODECAIRN_REVIEW_READ_ONLY === "1") {
+      return {
+        systemPrompt: `${event.systemPrompt}
+
+## CodeCairn read-only review policy
+
+This turn answers a review question. You may inspect repository content, search,
+and explain findings. Do not edit or write files and do not invoke shell
+commands; mutation-capable tools are blocked for this turn.`,
+      };
+    }
     return {
       systemPrompt: `${event.systemPrompt}
 
@@ -275,6 +286,20 @@ because the requested change appears small.`,
   });
 
   pi.on("tool_call", async (event, ctx) => {
+    if (
+      process.env.CODECAIRN_REVIEW_READ_ONLY === "1"
+      && ["bash", "edit", "write"].includes(event.toolName)
+    ) {
+      const reason = (
+        `Tool ${event.toolName} is unavailable in a read-only review turn.`
+      );
+      record(ctx, "read_only_tool_blocked", {
+        tool_name: event.toolName,
+        tool_call_id: event.toolCallId,
+        reason,
+      }, event.toolCallId);
+      return { block: true, reason };
+    }
     let path: string | undefined;
     try {
       path = toolPath(event.input, ctx.cwd);

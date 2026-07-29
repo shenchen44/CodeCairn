@@ -287,6 +287,121 @@ class Publication(BaseModel):
     provenance: Provenance
 
 
+class ReviewMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    role: Literal["user", "assistant", "system"]
+    content: str
+    agent_run_id: str | None = None
+    references: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class ReviewThread(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    title: str
+    target_type: Literal["change", "file", "hunk", "evidence", "decision"]
+    target_id: str = ""
+    status: Literal["open", "resolved"] = "open"
+    messages: list[ReviewMessage] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ChangeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    thread_id: str
+    prompt: str
+    target_type: Literal["change", "file", "hunk"]
+    target_id: str = ""
+    source_revision_id: str
+    result_revision_id: str = ""
+    agent_run_id: str = ""
+    status: Literal[
+        "queued", "running", "completed", "failed", "cancelled"
+    ] = "queued"
+    created_at: datetime = Field(default_factory=utc_now)
+    completed_at: datetime | None = None
+
+
+class AgentRun(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    thread_id: str
+    mode: Literal["ask", "change"]
+    prompt: str
+    target_type: Literal[
+        "change", "file", "hunk", "evidence", "decision"
+    ] = "change"
+    target_id: str = ""
+    status: Literal[
+        "queued", "starting", "running", "completed", "failed", "cancelled"
+    ] = "queued"
+    provider: str = "pi"
+    session_id: str = ""
+    process_id: int | None = None
+    answer: str = ""
+    event_count: int = 0
+    error: str = ""
+    source_revision_id: str
+    result_revision_id: str = ""
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class DeliveryStep(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: Literal[
+        "preflight",
+        "branch",
+        "stage",
+        "commit",
+        "push",
+        "pull_request",
+        "evidence",
+    ]
+    status: Literal["pending", "running", "completed", "failed", "skipped"]
+    detail: str = ""
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class DeliveryRun(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    status: Literal[
+        "queued",
+        "preflight",
+        "committing",
+        "pushing",
+        "creating_pr",
+        "publishing_evidence",
+        "completed",
+        "failed",
+    ] = "queued"
+    repository: str = ""
+    base_branch: str
+    branch: str = ""
+    selected_paths: list[str] = Field(default_factory=list)
+    commit_message: str
+    commit_sha: str = ""
+    pr_number: int | None = None
+    pr_url: str = ""
+    steps: list[DeliveryStep] = Field(default_factory=list)
+    error: str = ""
+    retryable: bool = True
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    completed_at: datetime | None = None
+
+
 class CIManifest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -456,7 +571,7 @@ class CaptureEvent(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["1", "2", "3"] = "1"
     event_id: str
     session_id: str
     host: Literal[
@@ -537,6 +652,10 @@ class ChangeProof(BaseModel):
     capture_events: list[CaptureEvent] = Field(default_factory=list)
     decision_records: list[DecisionRecord] = Field(default_factory=list)
     publications: list[Publication] = Field(default_factory=list)
+    review_threads: list[ReviewThread] = Field(default_factory=list)
+    change_requests: list[ChangeRequest] = Field(default_factory=list)
+    agent_runs: list[AgentRun] = Field(default_factory=list)
+    delivery_runs: list[DeliveryRun] = Field(default_factory=list)
     ci_verifications: list[CIVerificationResult] = Field(default_factory=list)
     ci_attestations: list[CIAttestation] = Field(default_factory=list)
     risks: list[ResidualRisk] = Field(default_factory=list)

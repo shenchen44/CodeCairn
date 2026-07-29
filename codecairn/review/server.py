@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import os
 import platform
@@ -10,12 +11,19 @@ import subprocess
 import tempfile
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Protocol
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 from pydantic import BaseModel, Field
 
 from codecairn.verification.config import parse_command
@@ -37,17 +45,29 @@ from codecairn.review.analyzer import (
     sync_hunk_requirement_ids,
 )
 from codecairn.review.models import (
+    AgentRun,
+    ChangeRequest,
     ChangeProof,
     CoverageAssertion,
+    DeliveryRun,
     LedgerEvent,
     Mapping,
     Provenance,
     Requirement,
     RequirementRevision,
+    ReviewThread,
     ReviewDecision,
     GitSnapshotRevision,
     Verification,
 )
+from codecairn.delivery import DeliveryOrchestrator
+from codecairn.github.publishing import (
+    GitHubIntegrationError,
+    GitHubPublicationService,
+    repository_slug,
+    resolve_github_credential,
+)
+from codecairn.review.runtime import PiAgentManager, ReviewEventBroker
 from codecairn.review.ledger import (
     migrate_legacy_events,
     new_ledger_event,
@@ -124,6 +144,27 @@ class VerificationRequest(BaseModel):
     hunk_ids: list[str] = Field(default_factory=list)
     file_change_ids: list[str] = Field(default_factory=list)
     prepare_dependencies: bool = False
+
+
+class ReviewThreadCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    target_type: str = "change"
+    target_id: str = ""
+
+
+class AgentRunCreate(BaseModel):
+    thread_id: str = ""
+    mode: str = "ask"
+    prompt: str = Field(min_length=1, max_length=20000)
+    target_type: str = "change"
+    target_id: str = ""
+
+
+class DeliveryCreate(BaseModel):
+    base_branch: str = Field(default="main", min_length=1, max_length=200)
+    commit_message: str = Field(min_length=1, max_length=500)
+    selected_paths: list[str] = Field(default_factory=list)
+    github_repository: str | None = None
 
 
 class UnsafeExternalSymlink(RuntimeError):
@@ -427,6 +468,18 @@ class ReviewState:
         ]
         fresh.decision_records = [
             item.model_copy(deep=True) for item in previous.decision_records
+        ]
+        fresh.review_threads = [
+            item.model_copy(deep=True) for item in previous.review_threads
+        ]
+        fresh.change_requests = [
+            item.model_copy(deep=True) for item in previous.change_requests
+        ]
+        fresh.agent_runs = [
+            item.model_copy(deep=True) for item in previous.agent_runs
+        ]
+        fresh.delivery_runs = [
+            item.model_copy(deep=True) for item in previous.delivery_runs
         ]
         compile_decision_events(
             fresh,
@@ -829,6 +882,13 @@ class ProgressiveReviewState:
         with self._lock:
             return self._state is not None
 
+    def resolved(self) -> ReviewState:
+        with self._lock:
+            state = self._state
+        if state is None:
+            raise RuntimeError("review_state_not_ready")
+        return state
+
     @property
     def proof(self) -> ChangeProof:
         with self._lock:
@@ -1019,6 +1079,18 @@ def _inherit_review_revision(
     ]
     fresh.publications = [
         item.model_copy(deep=True) for item in previous.publications
+    ]
+    fresh.review_threads = [
+        item.model_copy(deep=True) for item in previous.review_threads
+    ]
+    fresh.change_requests = [
+        item.model_copy(deep=True) for item in previous.change_requests
+    ]
+    fresh.agent_runs = [
+        item.model_copy(deep=True) for item in previous.agent_runs
+    ]
+    fresh.delivery_runs = [
+        item.model_copy(deep=True) for item in previous.delivery_runs
     ]
     fresh.ci_verifications = [
         item.model_copy(deep=True) for item in previous.ci_verifications
@@ -1367,6 +1439,89 @@ def create_review_app(
     hosts = allowed_hosts or {"127.0.0.1", "localhost"}
     app = FastAPI(title="CodeCairn Local Review", docs_url=None, redoc_url=None)
     app.state.session_token = token
+    broker = ReviewEventBroker()
+    state_lock = threading.RLock()
+
+    def active_state() -> ReviewState:
+        if isinstance(state, ProgressiveReviewState):
+            return state.resolved()
+        return state
+
+    def replace_state(updated: ReviewState) -> None:
+        if isinstance(state, ProgressiveReviewState):
+            with state._lock:
+                state._state = updated
+            return
+        state.proof = updated.proof
+        state.runner = updated.runner
+        state.storage_path = updated.storage_path
+        state.storage_root = updated.storage_root
+        state.audit_sequence = updated.audit_sequence
+        state.current_stale = updated.current_stale
+
+    def refresh_after_agent_change(run: AgentRun) -> None:
+        with state_lock:
+            current = active_state()
+            updated = load_or_create_review_state(
+                current.repo,
+                base_ref=current.proof.git_snapshot.base_ref,
+                requirement_texts=[
+                    item.text
+                    for item in current.proof.requirements
+                    if not item.deleted
+                ],
+                storage_root=current.storage_root,
+                runner=current.runner,
+            )
+            copied_run = next(
+                (
+                    item
+                    for item in updated.proof.agent_runs
+                    if item.id == run.id
+                ),
+                None,
+            )
+            if copied_run is not None:
+                copied_run.result_revision_id = updated.proof.revision_id
+            run.result_revision_id = updated.proof.revision_id
+            request_record = next(
+                (
+                    item
+                    for item in updated.proof.change_requests
+                    if item.agent_run_id == run.id
+                ),
+                None,
+            )
+            if request_record is not None:
+                request_record.status = "completed"
+                request_record.result_revision_id = updated.proof.revision_id
+                request_record.completed_at = datetime.now(timezone.utc)
+            updated.commit(
+                "agent_change_applied",
+                {
+                    "agent_run_id": run.id,
+                    "source_revision_id": run.source_revision_id,
+                    "result_revision_id": updated.proof.revision_id,
+                },
+                actor_type="model",
+                actor_id=run.provider,
+            )
+            replace_state(updated)
+        broker.publish(
+            "proof_updated",
+            {
+                "run_id": run.id,
+                "revision_id": updated.proof.revision_id,
+            },
+        )
+
+    agent_manager = PiAgentManager(
+        repo=state.repo,
+        get_proof=lambda: active_state().proof,
+        persist=lambda: active_state().persist(),
+        refresh_after_change=refresh_after_agent_change,
+        broker=broker,
+    )
 
     @app.middleware("http")
     async def security_boundary(request: Request, call_next):
@@ -1378,12 +1533,14 @@ def create_review_app(
             return JSONResponse({"detail": "invalid_origin"}, status_code=403)
         if request.url.path.startswith("/api/"):
             supplied = request.headers.get("x-codecairn-token", "")
+            if request.url.path == "/api/events" and not supplied:
+                supplied = request.cookies.get("codecairn_session", "")
             if not secrets.compare_digest(supplied, token):
                 return JSONResponse({"detail": "invalid_session_token"}, status_code=401)
             if (
                 isinstance(state, ProgressiveReviewState)
                 and not state.ready
-                and request.url.path != "/api/loading"
+                and request.url.path not in {"/api/loading", "/api/events"}
             ):
                 return JSONResponse(
                     state.loading_snapshot(),
@@ -1441,6 +1598,295 @@ def create_review_app(
             "files": [],
             "error": "",
         }
+
+    @app.get("/api/events")
+    def review_events(request: Request) -> StreamingResponse:
+        raw = request.headers.get("last-event-id") or request.query_params.get(
+            "after", "0"
+        )
+        try:
+            after = max(0, int(raw))
+        except ValueError:
+            after = 0
+        async def event_stream():
+            cursor = after
+            idle_ticks = 0
+            while not await request.is_disconnected():
+                events = broker.events_after(cursor)
+                if events:
+                    idle_ticks = 0
+                    for event in events:
+                        cursor = int(event["sequence"])
+                        yield broker.encode(event)
+                    continue
+                idle_ticks += 1
+                if idle_ticks >= 30:
+                    idle_ticks = 0
+                    yield ": keepalive\n\n"
+                await asyncio.sleep(0.5)
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.get("/api/review/threads")
+    def list_review_threads() -> list[dict]:
+        return [
+            item.model_dump(mode="json")
+            for item in active_state().proof.review_threads
+        ]
+
+    @app.post("/api/review/threads")
+    def create_review_thread(request: ReviewThreadCreate) -> dict:
+        if request.target_type not in {
+            "change",
+            "file",
+            "hunk",
+            "evidence",
+            "decision",
+        }:
+            raise HTTPException(
+                status_code=400, detail="invalid_review_target"
+            )
+        current = active_state()
+        record = ReviewThread(
+            id=f"thread_{secrets.token_hex(8)}",
+            title=" ".join(request.title.split()),
+            target_type=request.target_type,
+            target_id=request.target_id,
+        )
+        current.proof.review_threads.append(record)
+        current.commit(
+            "review_thread_created",
+            {
+                "thread_id": record.id,
+                "target_type": record.target_type,
+                "target_id": record.target_id,
+            },
+        )
+        broker.publish(
+            "review_thread",
+            {"thread": record.model_dump(mode="json")},
+        )
+        return record.model_dump(mode="json")
+
+    @app.post("/api/agent/runs")
+    def create_agent_run(request: AgentRunCreate) -> dict:
+        if request.mode not in {"ask", "change"}:
+            raise HTTPException(status_code=400, detail="invalid_agent_mode")
+        allowed_targets = (
+            {"change", "file", "hunk"}
+            if request.mode == "change"
+            else {"change", "file", "hunk", "evidence", "decision"}
+        )
+        if request.target_type not in allowed_targets:
+            raise HTTPException(
+                status_code=400, detail="invalid_agent_target"
+            )
+        current = active_state()
+        thread = next(
+            (
+                item
+                for item in current.proof.review_threads
+                if item.id == request.thread_id
+            ),
+            None,
+        )
+        if thread is None:
+            thread = ReviewThread(
+                id=f"thread_{secrets.token_hex(8)}",
+                title=request.prompt.strip()[:120],
+                target_type=request.target_type,
+                target_id=request.target_id,
+            )
+            current.proof.review_threads.append(thread)
+        run = AgentRun(
+            id=f"agent_{secrets.token_hex(8)}",
+            thread_id=thread.id,
+            mode=request.mode,
+            prompt=request.prompt.strip(),
+            target_type=request.target_type,
+            target_id=request.target_id,
+            source_revision_id=current.proof.revision_id,
+        )
+        if request.mode == "change":
+            change_request = ChangeRequest(
+                id=f"change_request_{secrets.token_hex(8)}",
+                thread_id=thread.id,
+                prompt=run.prompt,
+                target_type=request.target_type,
+                target_id=request.target_id,
+                source_revision_id=current.proof.revision_id,
+                agent_run_id=run.id,
+                status="running",
+            )
+            current.proof.change_requests.append(change_request)
+        try:
+            agent_manager.start(run)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        current.audit(
+            "agent_run_started",
+            {
+                "agent_run_id": run.id,
+                "mode": run.mode,
+                "thread_id": thread.id,
+                "target_type": run.target_type,
+                "target_id": run.target_id,
+            },
+            actor_type="reviewer",
+            actor_id="local_reviewer",
+        )
+        current.persist()
+        broker.publish(
+            "agent_status",
+            {"run_id": run.id, "status": "queued"},
+        )
+        return run.model_dump(mode="json")
+
+    @app.post("/api/agent/runs/{run_id}/abort")
+    def abort_agent_run(run_id: str) -> dict:
+        if not agent_manager.abort(run_id):
+            raise HTTPException(status_code=404, detail="agent_run_not_active")
+        return {"run_id": run_id, "status": "cancelled"}
+
+    @app.get("/api/deliveries")
+    def list_deliveries() -> list[dict]:
+        return [
+            item.model_dump(mode="json")
+            for item in active_state().proof.delivery_runs
+        ]
+
+    @app.post("/api/deliveries")
+    def create_delivery(request: DeliveryCreate) -> dict:
+        current = active_state()
+        try:
+            credential = resolve_github_credential()
+            origin_slug = repository_slug(current.repo)
+            slug = repository_slug(
+                current.repo, override=request.github_repository
+            )
+        except GitHubIntegrationError as exc:
+            raise HTTPException(status_code=400, detail=exc.code) from exc
+        if any(
+            item.status
+            not in {"completed", "failed"}
+            for item in current.proof.delivery_runs
+        ):
+            raise HTTPException(
+                status_code=409, detail="delivery_already_active"
+            )
+        commit_message = " ".join(request.commit_message.split())
+        run = next(
+            (
+                item
+                for item in reversed(current.proof.delivery_runs)
+                if item.status == "failed"
+                and item.repository == slug
+                and item.base_branch == request.base_branch
+                and item.commit_message == commit_message
+            ),
+            None,
+        )
+        if run is None:
+            run = DeliveryRun(
+                id=f"delivery_{secrets.token_hex(8)}",
+                repository=slug,
+                base_branch=request.base_branch,
+                selected_paths=request.selected_paths,
+                commit_message=commit_message,
+            )
+            current.proof.delivery_runs.append(run)
+        else:
+            run.status = "queued"
+            run.error = ""
+            for step in run.steps:
+                if step.status == "failed":
+                    step.status = "pending"
+                    step.detail = ""
+        current.audit(
+            "delivery_retried" if run.steps else "delivery_started",
+            {
+                "delivery_run_id": run.id,
+                "repository": slug,
+                "base_branch": run.base_branch,
+            },
+        )
+        current.persist()
+
+        def update_delivery(changed: DeliveryRun) -> None:
+            with state_lock:
+                active_state().persist()
+            broker.publish(
+                "delivery_status",
+                {"delivery": changed.model_dump(mode="json")},
+            )
+
+        def execute_delivery() -> None:
+            service = GitHubPublicationService(credential.token)
+            orchestrator = DeliveryOrchestrator(
+                repo=current.repo,
+                proof=current.proof,
+                run=run,
+                github=service,
+                repository_slug=slug,
+                head_repository_slug=origin_slug,
+                evidence_markdown=proof_markdown(
+                    current.proof, stale=current.stale
+                ),
+                on_update=update_delivery,
+            )
+            try:
+                asyncio.run(orchestrator.run_delivery())
+            except Exception:
+                return
+            with state_lock:
+                refreshed = load_or_create_review_state(
+                    current.repo,
+                    base_ref=current.proof.git_snapshot.base_ref,
+                    requirement_texts=[
+                        item.text
+                        for item in current.proof.requirements
+                        if not item.deleted
+                    ],
+                    storage_root=current.storage_root,
+                    runner=current.runner,
+                )
+                refreshed.commit(
+                    "delivery_completed",
+                    {
+                        "delivery_run_id": run.id,
+                        "commit_sha": run.commit_sha,
+                        "pr_number": run.pr_number,
+                        "pr_url": run.pr_url,
+                    },
+                    actor_type="adapter",
+                    actor_id="github",
+                )
+                replace_state(refreshed)
+            broker.publish(
+                "proof_updated",
+                {
+                    "delivery_run_id": run.id,
+                    "revision_id": refreshed.proof.revision_id,
+                },
+            )
+
+        threading.Thread(
+            target=execute_delivery,
+            daemon=True,
+            name=f"codecairn-delivery-{run.id[-8:]}",
+        ).start()
+        broker.publish(
+            "delivery_status",
+            {"delivery": run.model_dump(mode="json")},
+        )
+        return run.model_dump(mode="json")
 
     @app.get("/api/proof")
     def get_proof() -> dict:
@@ -2259,6 +2705,10 @@ REVIEW_HTML = """<!doctype html>
     <span id="stale" class="status stale" hidden></span>
     <span id="assurance" class="status" title="当前变更的证据完整度"></span>
   </div>
+  <div class="top-actions">
+    <button id="assistantButton" class="secondary-action">AI 审查</button>
+    <button id="deliveryButton" class="primary-action">创建 PR</button>
+  </div>
   <details class="export-menu">
     <summary id="exportButton">导出</summary>
     <div class="export-options">
@@ -2311,6 +2761,47 @@ REVIEW_HTML = """<!doctype html>
     <div id="ciTrust" hidden></div>
   </aside>
 </div>
+<aside id="assistantPanel" class="assistant-panel" hidden>
+  <header class="assistant-heading">
+    <div><span class="eyebrow">上下文对话</span><h2>AI 审查助手</h2></div>
+    <button id="closeAssistant" class="icon-button" title="关闭 AI 助手" aria-label="关闭 AI 助手">×</button>
+  </header>
+  <div class="assistant-context">
+    <span>当前范围</span><strong id="assistantContext">完整变更</strong>
+  </div>
+  <div class="assistant-modes" role="tablist" aria-label="AI 操作">
+    <button id="askMode" class="active" role="tab">询问代码</button>
+    <button id="changeMode" role="tab">要求修改</button>
+  </div>
+  <div id="assistantMessages" class="assistant-messages" aria-live="polite">
+    <p class="assistant-empty">选择代码行后提问，回答会引用当前仓库；要求修改会启动 Pi 并在完成后刷新本页。</p>
+  </div>
+  <form id="assistantForm" class="assistant-composer">
+    <textarea id="assistantPrompt" rows="4" maxlength="20000" placeholder="询问这处修改的原因、风险或测试覆盖…"></textarea>
+    <div>
+      <span id="agentState">就绪</span>
+      <button id="stopAgent" type="button" hidden>停止</button>
+      <button id="sendAgent" type="submit" class="primary-action">发送</button>
+    </div>
+  </form>
+</aside>
+<dialog id="deliveryDialog" class="delivery-dialog">
+  <form id="deliveryForm">
+    <header>
+      <div><span class="eyebrow">交付工作流</span><h2>提交并创建 Pull Request</h2></div>
+      <button id="closeDelivery" type="button" class="icon-button" aria-label="关闭">×</button>
+    </header>
+    <p id="deliveryScope" class="delivery-scope"></p>
+    <label>目标分支<input id="deliveryBase" value="main" maxlength="200"></label>
+    <label>提交说明<input id="deliveryMessage" maxlength="500" required></label>
+    <div id="deliverySteps" class="delivery-steps"></div>
+    <p id="deliveryError" class="delivery-error" hidden></p>
+    <footer>
+      <a id="deliveryLink" target="_blank" rel="noreferrer" hidden>打开 Pull Request</a>
+      <button id="startDelivery" type="submit" class="primary-action">开始交付</button>
+    </footer>
+  </form>
+</dialog>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 </body></html>"""
 
@@ -2318,17 +2809,18 @@ REVIEW_HTML = """<!doctype html>
 REVIEW_CSS = """
 :root{color-scheme:light;--bg:#eef1f4;--panel:#fff;--panel-subtle:#f7f8fa;--panel-strong:#f0f3f5;--line:#dfe3e8;--line-strong:#c4cbd3;--text:#17202a;--muted:#687483;--faint:#8d98a5;--brand:#08aeb5;--brand-dark:#087d83;--brand-soft:#e6f7f7;--green:#16834a;--green-soft:#e6f5ec;--red:#bb3b45;--red-soft:#fcebed;--amber:#95620a;--amber-soft:#fff5db;--blue:#3468a8;--blue-soft:#edf4fb;--code:#232a33;--shadow:0 16px 38px rgba(30,42,55,.15)}
 @media(prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#10151b;--panel:#171d24;--panel-subtle:#1c232b;--panel-strong:#222a34;--line:#303944;--line-strong:#4a5663;--text:#e8edf2;--muted:#a1acb8;--faint:#7d8996;--brand:#24c2c8;--brand-dark:#56d4d8;--brand-soft:#14383a;--green:#77d29b;--green-soft:#18382a;--red:#f18b91;--red-soft:#3c2227;--amber:#f4c56e;--amber-soft:#3a311c;--blue:#8bb8ec;--blue-soft:#1b2d42;--code:#e6ebf1;--shadow:0 18px 44px rgba(0,0,0,.35)}}
-*{box-sizing:border-box;letter-spacing:0}[hidden]{display:none!important}html,body{height:100%}body{margin:0;overflow:hidden;background:var(--bg);color:var(--text);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select,summary{font:inherit}button,summary{color:var(--text);cursor:pointer}button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
-.topbar{height:64px;background:var(--panel);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px;padding:8px 16px;position:relative;z-index:8}.brand-mark{width:31px;height:31px;display:flex;align-items:flex-end;gap:2px;flex:0 0 auto}.brand-mark i{display:block;width:8px;background:var(--brand)}.brand-mark i:nth-child(1){height:13px}.brand-mark i:nth-child(2){height:22px}.brand-mark i:nth-child(3){height:31px}.brand-copy{display:flex;flex-direction:column;min-width:94px}.brand-copy strong{font-size:14px}.brand-copy span,.review-title p{color:var(--muted);font-size:11px}.review-title{min-width:160px;flex:1;overflow:hidden;border-left:1px solid var(--line);padding-left:14px}.review-title h1{margin:0;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.review-title p{margin:2px 0 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.view-tabs{display:flex;height:40px;background:var(--panel-subtle);border:1px solid var(--line);border-radius:6px;padding:3px}.tab{border:0;background:transparent;padding:0 14px;border-radius:4px;color:var(--muted);font-weight:650}.tab.active{background:var(--panel);color:var(--text);box-shadow:0 1px 3px rgba(20,30,40,.1)}.review-state{display:flex;gap:6px}.status{border:1px solid var(--line);border-radius:4px;padding:4px 7px;font-size:10px;font-weight:750;text-transform:uppercase;color:var(--muted)}.status.stale{border-color:var(--amber);color:var(--amber);background:var(--amber-soft)}.export-menu{position:relative}.export-menu summary{list-style:none;border:1px solid var(--brand);background:var(--brand);color:#052f31;border-radius:5px;padding:7px 12px;font-weight:750}.export-menu summary::-webkit-details-marker{display:none}.export-options{position:absolute;right:0;top:42px;width:178px;background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow);padding:5px;border-radius:6px}.export-options button{display:block;width:100%;border:0;background:transparent;text-align:left;padding:8px 9px;border-radius:4px}.export-options button:hover{background:var(--brand-soft)}
+*{box-sizing:border-box;letter-spacing:0}[hidden]{display:none!important}html,body{height:100%}body{margin:0;overflow:hidden;background:var(--bg);color:var(--text);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select,textarea,summary{font:inherit}button,summary{color:var(--text);cursor:pointer}button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
+.topbar{height:64px;background:var(--panel);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px;padding:8px 16px;position:relative;z-index:8}.brand-mark{width:31px;height:31px;display:flex;align-items:flex-end;gap:2px;flex:0 0 auto}.brand-mark i{display:block;width:8px;background:var(--brand)}.brand-mark i:nth-child(1){height:13px}.brand-mark i:nth-child(2){height:22px}.brand-mark i:nth-child(3){height:31px}.brand-copy{display:flex;flex-direction:column;min-width:94px}.brand-copy strong{font-size:14px}.brand-copy span,.review-title p{color:var(--muted);font-size:11px}.review-title{min-width:140px;flex:1;overflow:hidden;border-left:1px solid var(--line);padding-left:14px}.review-title h1{margin:0;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.review-title p{margin:2px 0 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.view-tabs{display:flex;height:40px;background:var(--panel-subtle);border:1px solid var(--line);border-radius:6px;padding:3px}.tab{border:0;background:transparent;padding:0 14px;border-radius:4px;color:var(--muted);font-weight:650}.tab.active{background:var(--panel);color:var(--text);box-shadow:0 1px 3px rgba(20,30,40,.1)}.review-state,.top-actions{display:flex;gap:6px}.status{border:1px solid var(--line);border-radius:4px;padding:4px 7px;font-size:10px;font-weight:750;text-transform:uppercase;color:var(--muted)}.status.stale{border-color:var(--amber);color:var(--amber);background:var(--amber-soft)}.primary-action,.secondary-action{min-height:34px;border-radius:5px;padding:0 12px;font-weight:750}.primary-action{border:1px solid var(--brand);background:var(--brand);color:#052f31}.primary-action:hover{background:var(--brand-dark);border-color:var(--brand-dark);color:#fff}.primary-action:disabled{opacity:.45;cursor:not-allowed}.secondary-action{border:1px solid var(--line-strong);background:var(--panel);color:var(--text)}.secondary-action:hover{border-color:var(--brand);color:var(--brand-dark)}.export-menu{position:relative}.export-menu summary{list-style:none;border:1px solid var(--line-strong);background:var(--panel);color:var(--text);border-radius:5px;padding:7px 12px;font-weight:750}.export-menu summary::-webkit-details-marker{display:none}.export-options{position:absolute;right:0;top:42px;width:178px;background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow);padding:5px;border-radius:6px}.export-options button{display:block;width:100%;border:0;background:transparent;text-align:left;padding:8px 9px;border-radius:4px}.export-options button:hover{background:var(--brand-soft)}
 .workspace{height:calc(100vh - 64px);display:grid;grid-template-columns:252px minmax(540px,1fr) minmax(360px,420px);min-height:0}.workspace.drawer-closed{grid-template-columns:252px minmax(540px,1fr)}.file-panel,.evidence-panel{background:var(--panel);overflow:auto;min-height:0}.file-panel{border-right:1px solid var(--line);padding:16px 10px 12px}.evidence-panel{border-left:1px solid var(--line);padding:0 18px 24px}.evidence-panel.closed{display:none}.panel-heading,.logic-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}.panel-heading{margin:0 5px 12px}.panel-heading h2,.logic-heading h2,.graph-heading h2{margin:0;font-size:13px}.panel-heading>span{color:var(--muted);font-size:11px}.logic-heading{position:sticky;top:0;z-index:2;background:var(--panel);padding:16px 0 12px;border-bottom:1px solid var(--line)}.eyebrow{display:block;color:var(--brand-dark);font-size:9px;font-weight:850;margin-bottom:2px}#fileSearch{width:100%;height:34px;border:1px solid var(--line);background:var(--panel-subtle);border-radius:5px;padding:0 10px;color:var(--text);margin-bottom:10px}.file-list{display:flex;flex-direction:column;gap:2px}.file-row{width:100%;min-height:44px;border:0;border-left:3px solid transparent;background:transparent;text-align:left;padding:7px 8px;display:grid;grid-template-columns:24px minmax(0,1fr);align-items:center;border-radius:0 4px 4px 0}.file-row:hover{background:var(--panel-subtle)}.file-row.active{background:var(--brand-soft);border-left-color:var(--brand)}.file-kind{display:grid;place-items:center;width:18px;height:18px;border:1px solid var(--line-strong);border-radius:3px;font-size:9px;font-weight:850;color:var(--muted)}.file-row.active .file-kind{border-color:var(--brand);color:var(--brand-dark)}.file-copy{min-width:0}.file-name{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}.file-folder{display:block;color:var(--muted);font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px}.change-stats{border-top:1px solid var(--line);margin:14px 5px 0;padding-top:12px;color:var(--muted);font-size:11px}
 .workspace.graph-active{grid-template-columns:minmax(0,1fr) minmax(360px,420px)}.workspace.graph-active.drawer-closed{grid-template-columns:minmax(0,1fr)}.workspace.graph-active .file-panel{display:none}
 .loading-progress{position:sticky;top:0;z-index:3;margin:0 0 10px;padding:9px 9px 8px;background:var(--panel);border:1px solid var(--line);border-radius:5px;box-shadow:0 6px 14px rgba(20,35,45,.08)}.loading-progress>div{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px;color:var(--muted);font-size:10px}.loading-progress strong{color:var(--brand-dark);font-size:10px}.loading-progress progress{display:block;width:100%;height:4px;border:0;border-radius:3px;overflow:hidden;background:var(--line)}.loading-progress progress::-webkit-progress-bar{background:var(--line)}.loading-progress progress::-webkit-progress-value{background:var(--brand);transition:width .22s ease}.loading-progress progress::-moz-progress-bar{background:var(--brand)}.loading-file-row{pointer-events:none;animation:file-arrive .42s cubic-bezier(.2,.8,.2,1) both;background:var(--brand-soft);border-left-color:var(--brand)}.loading-file-row::after{content:"";grid-column:2;width:42%;height:2px;margin-top:5px;background:linear-gradient(90deg,var(--brand),transparent);animation:file-scan .8s ease both}.loading-file-row .file-kind{border-color:var(--brand);color:var(--brand-dark)}@keyframes file-arrive{0%{opacity:0;transform:translateY(-8px)}65%{opacity:1;transform:translateY(1px)}100%{opacity:1;transform:none;background:transparent}}@keyframes file-scan{0%{opacity:0;transform:scaleX(.2);transform-origin:left}45%{opacity:1}100%{opacity:0;transform:scaleX(1);transform-origin:left}}.loading-shell{max-width:430px;margin:72px auto;padding:0 24px;text-align:center;color:var(--muted)}.loading-shell-mark{width:36px;height:28px;margin:0 auto 15px;display:flex;align-items:flex-end;justify-content:center;gap:3px}.loading-shell-mark i{width:7px;background:var(--brand);animation:loading-bars 1s ease-in-out infinite}.loading-shell-mark i:nth-child(1){height:12px}.loading-shell-mark i:nth-child(2){height:21px;animation-delay:.12s}.loading-shell-mark i:nth-child(3){height:28px;animation-delay:.24s}.loading-shell strong{display:block;color:var(--text);margin-bottom:5px}.loading-shell p{margin:0;font-size:12px}@keyframes loading-bars{0%,100%{opacity:.35;transform:scaleY(.65);transform-origin:bottom}50%{opacity:1;transform:scaleY(1)}}.topbar.loading .view-tabs button,.topbar.loading .export-menu{opacity:.45;pointer-events:none}.topbar.loading .status{color:var(--brand-dark);border-color:var(--brand)}
 .review-panel{min-width:0;overflow:hidden;background:var(--panel)}#diffView{height:100%;display:flex;flex-direction:column}.file-toolbar{height:48px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 12px;gap:12px}.file-toolbar>div{min-width:0;overflow:hidden}.file-toolbar strong{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap}.file-toolbar span{margin-left:9px;color:var(--muted);font-size:10px;text-transform:uppercase}.logic-toggle,.icon-button{border:1px solid var(--line);background:var(--panel);border-radius:4px;padding:5px 8px;white-space:nowrap}.logic-toggle:hover,.icon-button:hover{border-color:var(--brand);color:var(--brand-dark)}.icon-button{width:29px;height:29px;padding:0;font-size:18px;color:var(--muted)}.column-heads{height:34px;display:grid;grid-template-columns:1fr 1fr;border-bottom:1px solid var(--line);background:var(--panel-subtle);color:var(--muted);font-size:10px;font-weight:750}.column-heads span{padding:9px 48px}.column-heads span+span{border-left:1px solid var(--line)}.diff-table{flex:1;overflow:auto;font:12px/20px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--code);scrollbar-color:var(--line-strong) transparent}.diff-row{display:grid;grid-template-columns:minmax(360px,1fr) minmax(360px,1fr);min-height:20px;border-bottom:1px solid transparent;align-items:stretch}.diff-row.changed{cursor:pointer}.diff-row.changed:hover{box-shadow:inset 3px 0 var(--brand)}.diff-row.selected{box-shadow:inset 3px 0 var(--brand);outline:1px solid var(--brand);outline-offset:-1px}.code-side{display:grid;grid-template-columns:42px minmax(0,1fr);min-width:0;align-items:stretch}.code-side+.code-side{border-left:1px solid var(--line)}.line-number{background:var(--panel-subtle);border-right:1px solid var(--line);color:var(--faint);text-align:right;padding-right:8px;user-select:none}.code-text{white-space:pre-wrap;overflow-wrap:anywhere;word-break:normal;min-width:0;min-height:20px;padding:0 9px;overflow:hidden;tab-size:4}.diff-row.insert .after,.diff-row.replace .after{background:var(--green-soft)}.diff-row.insert .after .line-number,.diff-row.replace .after .line-number{background:color-mix(in srgb,var(--green-soft) 70%,var(--green) 30%)}.diff-row.delete .before,.diff-row.replace .before{background:var(--red-soft)}.diff-row.delete .before .line-number,.diff-row.replace .before .line-number{background:color-mix(in srgb,var(--red-soft) 70%,var(--red) 30%)}.empty-message{padding:40px 18px;color:var(--muted);text-align:center}
 .logic-content{display:flex;flex-direction:column}.logic-hero{padding:14px 0 13px;border-bottom:1px solid var(--line)}.logic-hero strong{display:block;font-size:13px;margin-bottom:4px}.logic-hero p{margin:0;color:var(--muted);font-size:12px}.logic-section{padding:14px 0;border-bottom:1px solid var(--line)}.logic-section.primary{border-left:3px solid var(--brand);padding-left:12px}.logic-section.warning{border-left:3px solid var(--amber);padding-left:12px}.logic-section-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px}.logic-section h3{font-size:13px;margin:0;overflow-wrap:anywhere}.section-label{font-size:9px;font-weight:850;color:var(--muted);text-transform:uppercase}.source-badge,.state-badge{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:3px;padding:2px 5px;font-size:9px;font-weight:750;color:var(--muted);white-space:nowrap}.source-badge.captured{color:var(--brand-dark);border-color:var(--brand);background:var(--brand-soft)}.source-badge.derived,.source-badge.inferred{color:var(--blue);border-color:var(--blue);background:var(--blue-soft)}.source-badge.verified{color:var(--green);border-color:var(--green);background:var(--green-soft)}.logic-section p{margin:5px 0;color:var(--muted);overflow-wrap:anywhere}.logic-section .logic-main{color:var(--text);font-weight:600}.logic-section pre{margin:8px 0 0;padding:9px 10px;background:var(--panel-subtle);border-left:2px solid var(--line-strong);white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}.logic-list{margin:7px 0 0;padding-left:18px;color:var(--muted)}.logic-list li+li{margin-top:4px}.logic-kv{display:grid;grid-template-columns:82px minmax(0,1fr);gap:5px 10px;margin-top:10px;font-size:11px}.logic-kv dt{color:var(--faint)}.logic-kv dd{margin:0;color:var(--text);overflow-wrap:anywhere}.logic-details{border-bottom:1px solid var(--line);padding:11px 0}.logic-details summary{color:var(--muted);font-size:11px;font-weight:700;list-style:none}.logic-details summary::before{content:"+";display:inline-block;width:16px;color:var(--brand-dark)}.logic-details[open] summary::before{content:"−"}.logic-details .logic-section{border-bottom:0;padding-bottom:2px}.logic-empty{color:var(--muted);padding:18px 0}.requirement-list{margin:6px 0;padding-left:18px}
-.graph-view{height:100%;overflow:auto;padding:22px 24px;background:var(--panel-subtle)}.graph-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;border-bottom:1px solid var(--line);padding-bottom:14px}.graph-heading p{margin:0;color:var(--muted);font-size:11px}.graph-description{margin-top:4px!important}.graph-overview{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:1px;margin:16px 0;background:var(--line);border:1px solid var(--line);border-radius:6px;overflow:hidden}.graph-step{min-height:78px;background:var(--panel);padding:11px 13px;position:relative}.graph-step+.graph-step::before{content:"›";position:absolute;left:-8px;top:25px;z-index:1;width:16px;height:24px;display:grid;place-items:center;background:var(--panel);color:var(--brand-dark);font-size:18px}.graph-step span{display:block;color:var(--muted);font-size:10px}.graph-step strong{display:block;margin-top:3px;font-size:20px}.graph-step small{display:block;margin-top:2px;color:var(--faint);font-size:9px}.graph-alert{display:flex;align-items:flex-start;gap:9px;margin:12px 0;padding:10px 12px;border-left:3px solid var(--amber);background:var(--amber-soft);color:var(--amber);font-size:11px}.graph-alert.success{border-left-color:var(--green);background:var(--green-soft);color:var(--green)}.graph-toolbar{display:flex;align-items:center;gap:8px;margin:14px 0}.graph-mode{display:flex;padding:3px;border:1px solid var(--line);background:var(--panel);border-radius:5px}.graph-mode button{border:0;background:transparent;color:var(--muted);padding:5px 10px;border-radius:3px;font-size:11px;font-weight:700}.graph-mode button.active{background:var(--brand-soft);color:var(--brand-dark)}.graph-search{height:32px;min-width:180px;flex:1;border:1px solid var(--line);background:var(--panel);color:var(--text);border-radius:4px;padding:0 9px}.graph-controls{display:flex;gap:8px}.graph-controls select{height:32px;border:1px solid var(--line);background:var(--panel);color:var(--text);border-radius:4px;padding:0 28px 0 9px}.graph-result-summary{margin:0 0 9px;color:var(--muted);font-size:10px}.graph-group{margin:8px 0;border:1px solid var(--line);background:var(--panel);border-radius:5px;overflow:hidden}.graph-group>summary{list-style:none;padding:11px 13px;font-size:11px;font-weight:750;color:var(--text);display:flex;align-items:center;gap:7px}.graph-group>summary::before{content:"+";display:inline-grid;place-items:center;width:18px;height:18px;color:var(--brand-dark);background:var(--brand-soft);border-radius:3px}.graph-group[open]>summary::before{content:"−"}.graph-group-description{margin:-5px 13px 11px 38px;color:var(--muted);font-size:10px}.graph-layer{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:7px;padding:0 12px 12px}.graph-node{border:1px solid var(--line);border-left:3px solid var(--line-strong);background:var(--panel-subtle);border-radius:4px;padding:9px 10px;text-align:left;min-height:64px;white-space:pre-line}.graph-node:hover{border-left-color:var(--brand);background:var(--brand-soft)}.graph-node.incomplete{border-left-color:var(--amber)}.graph-more{margin:0 12px 12px;border:1px solid var(--line);background:var(--panel-subtle);color:var(--muted);border-radius:4px;padding:6px 10px}.graph-more:hover{border-color:var(--brand);color:var(--brand-dark)}.toast{position:fixed;right:18px;bottom:18px;z-index:10;background:#17212b;color:#fff;border-radius:5px;padding:9px 13px;opacity:0;transform:translateY(8px);pointer-events:none;transition:.18s}.toast.visible{opacity:1;transform:none}
+.graph-view{height:100%;overflow:auto;padding:22px 24px;background:var(--panel-subtle)}.graph-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;border-bottom:1px solid var(--line);padding-bottom:14px}.graph-heading p{margin:0;color:var(--muted);font-size:11px}.graph-description{margin-top:4px!important}.graph-overview{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:1px;margin:16px 0;background:var(--line);border:1px solid var(--line);border-radius:6px;overflow:hidden}.graph-step{min-height:78px;background:var(--panel);padding:11px 13px;position:relative}.graph-step+.graph-step::before{content:"›";position:absolute;left:-8px;top:25px;z-index:1;width:16px;height:24px;display:grid;place-items:center;background:var(--panel);color:var(--brand-dark);font-size:18px}.graph-step span{display:block;color:var(--muted);font-size:10px}.graph-step strong{display:block;margin-top:3px;font-size:20px}.graph-step small{display:block;margin-top:2px;color:var(--faint);font-size:9px}.graph-alert{display:flex;align-items:flex-start;gap:9px;margin:12px 0;padding:10px 12px;border-left:3px solid var(--amber);background:var(--amber-soft);color:var(--amber);font-size:11px}.graph-alert.success{border-left-color:var(--green);background:var(--green-soft);color:var(--green)}.graph-toolbar{display:flex;align-items:center;gap:8px;margin:14px 0}.graph-mode{display:flex;padding:3px;border:1px solid var(--line);background:var(--panel);border-radius:5px}.graph-mode button{border:0;background:transparent;color:var(--muted);padding:5px 10px;border-radius:3px;font-size:11px;font-weight:700}.graph-mode button.active{background:var(--brand-soft);color:var(--brand-dark)}.graph-search{height:32px;min-width:180px;flex:1;border:1px solid var(--line);background:var(--panel);color:var(--text);border-radius:4px;padding:0 9px}.graph-controls{display:flex;gap:8px}.graph-controls select{height:32px;border:1px solid var(--line);background:var(--panel);color:var(--text);border-radius:4px;padding:0 28px 0 9px}.graph-result-summary{margin:0 0 9px;color:var(--muted);font-size:10px}.graph-group{margin:8px 0;border:1px solid var(--line);background:var(--panel);border-radius:5px;overflow:hidden}.graph-group>summary{list-style:none;padding:11px 13px;font-size:11px;font-weight:750;color:var(--text);display:flex;align-items:center;gap:7px}.graph-group>summary::before{content:"+";display:inline-grid;place-items:center;width:18px;height:18px;color:var(--brand-dark);background:var(--brand-soft);border-radius:3px}.graph-group[open]>summary::before{content:"−"}.graph-group-description{margin:-5px 13px 11px 38px;color:var(--muted);font-size:10px}.graph-layer{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:7px;padding:0 12px 12px}.graph-node{border:1px solid var(--line);border-left:3px solid var(--line-strong);background:var(--panel-subtle);border-radius:4px;padding:9px 10px;text-align:left;min-height:64px;white-space:pre-line}.graph-node:hover{border-left-color:var(--brand);background:var(--brand-soft)}.graph-node.incomplete{border-left-color:var(--amber)}.graph-more{margin:0 12px 12px;border:1px solid var(--line);background:var(--panel-subtle);color:var(--muted);border-radius:4px;padding:6px 10px}.graph-more:hover{border-color:var(--brand);color:var(--brand-dark)}
+.assistant-panel{position:fixed;z-index:12;right:16px;top:76px;bottom:16px;width:min(430px,calc(100vw - 32px));display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow);border-radius:7px;overflow:hidden}.assistant-heading{display:flex;align-items:center;justify-content:space-between;padding:14px 15px;border-bottom:1px solid var(--line)}.assistant-heading h2,.delivery-dialog h2{margin:0;font-size:14px}.assistant-context{padding:10px 15px;background:var(--panel-subtle);border-bottom:1px solid var(--line);display:flex;gap:8px;font-size:11px}.assistant-context span{color:var(--muted)}.assistant-context strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.assistant-modes{display:grid;grid-template-columns:1fr 1fr;padding:8px 12px;border-bottom:1px solid var(--line);gap:4px}.assistant-modes button{height:32px;border:0;border-radius:4px;background:transparent;color:var(--muted);font-weight:700}.assistant-modes button.active{background:var(--brand-soft);color:var(--brand-dark)}.assistant-messages{flex:1;overflow:auto;padding:14px 15px}.assistant-empty{margin:20px 8px;color:var(--muted);font-size:12px}.assistant-message{margin:0 0 14px;padding-left:10px;border-left:2px solid var(--line-strong);white-space:pre-wrap;overflow-wrap:anywhere}.assistant-message.user{border-left-color:var(--brand)}.assistant-message strong{display:block;margin-bottom:4px;font-size:10px;color:var(--muted);text-transform:uppercase}.assistant-message p{margin:0}.assistant-composer{padding:12px;border-top:1px solid var(--line);background:var(--panel-subtle)}.assistant-composer textarea{display:block;width:100%;resize:vertical;max-height:180px;min-height:84px;border:1px solid var(--line-strong);border-radius:5px;padding:9px 10px;background:var(--panel);color:var(--text)}.assistant-composer>div{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:8px}.assistant-composer>div span{margin-right:auto;color:var(--muted);font-size:10px}.assistant-composer #stopAgent{border:0;background:transparent;color:var(--red)}.delivery-dialog{width:min(560px,calc(100vw - 28px));border:1px solid var(--line);border-radius:7px;padding:0;background:var(--panel);color:var(--text);box-shadow:var(--shadow)}.delivery-dialog::backdrop{background:rgba(13,20,28,.55)}.delivery-dialog form>header{display:flex;align-items:center;justify-content:space-between;padding:16px 18px;border-bottom:1px solid var(--line)}.delivery-dialog label{display:block;margin:13px 18px;color:var(--muted);font-size:11px}.delivery-dialog label input{display:block;width:100%;height:36px;margin-top:5px;border:1px solid var(--line-strong);border-radius:5px;padding:0 9px;background:var(--panel-subtle);color:var(--text)}.delivery-scope{margin:14px 18px;padding:9px 10px;background:var(--panel-subtle);border-left:3px solid var(--brand);font-size:11px;color:var(--muted)}.delivery-steps{margin:14px 18px;border-top:1px solid var(--line)}.delivery-step{display:grid;grid-template-columns:18px 110px minmax(0,1fr);gap:7px;padding:8px 0;border-bottom:1px solid var(--line);font-size:11px}.delivery-step i{width:9px;height:9px;margin-top:3px;border-radius:50%;background:var(--line-strong)}.delivery-step.running i{background:var(--brand);box-shadow:0 0 0 4px var(--brand-soft)}.delivery-step.completed i{background:var(--green)}.delivery-step.failed i{background:var(--red)}.delivery-step span:last-child{color:var(--muted);overflow-wrap:anywhere}.delivery-error{margin:12px 18px;color:var(--red);background:var(--red-soft);border-left:3px solid var(--red);padding:8px 10px}.delivery-dialog footer{display:flex;align-items:center;justify-content:flex-end;gap:12px;padding:13px 18px;border-top:1px solid var(--line)}.delivery-dialog footer a{margin-right:auto;color:var(--brand-dark);font-weight:700}.toast{position:fixed;right:18px;bottom:18px;z-index:20;background:#17212b;color:#fff;border-radius:5px;padding:9px 13px;opacity:0;transform:translateY(8px);pointer-events:none;transition:.18s}.toast.visible{opacity:1;transform:none}
 @media(max-width:1360px){.workspace{grid-template-columns:220px minmax(500px,1fr)}.workspace.drawer-closed{grid-template-columns:220px minmax(500px,1fr)}.evidence-panel{position:fixed;z-index:7;right:0;top:64px;bottom:0;width:min(380px,92vw);box-shadow:var(--shadow)}}
 @media(max-width:900px){.graph-overview{grid-template-columns:repeat(2,1fr)}.graph-step:last-child:nth-child(odd){grid-column:1/-1}.graph-step+.graph-step::before{display:none}.graph-toolbar{align-items:stretch;flex-wrap:wrap}.graph-search{order:3;flex-basis:100%}}
-@media(max-width:760px){.topbar{height:58px;padding:7px 9px;gap:8px}.brand-copy,.review-title,.review-state{display:none}.brand-mark{width:28px;height:28px}.view-tabs{margin-left:2px;height:36px}.tab{padding:0 10px}.export-menu{margin-left:auto}.export-menu summary{padding:6px 9px}.workspace,.workspace.drawer-closed{height:calc(100vh - 58px);display:grid;grid-template-columns:1fr;grid-template-rows:176px minmax(0,1fr)}.workspace.graph-active,.workspace.graph-active.drawer-closed{grid-template-rows:minmax(0,1fr)}.file-panel{border-right:0;border-bottom:1px solid var(--line);padding-top:10px}.file-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.change-stats{display:none}.review-panel{min-height:0}.evidence-panel{top:58px;width:calc(100vw - 16px)}.column-heads span{padding-left:47px}.diff-row{grid-template-columns:minmax(300px,1fr) minmax(300px,1fr)}.graph-view{padding:14px}.graph-heading{align-items:flex-start;flex-direction:column;gap:4px}.graph-overview{grid-template-columns:1fr 1fr}.graph-step{min-height:66px}.graph-mode,.graph-controls{width:100%}.graph-mode button,.graph-controls select{flex:1;min-width:0}.graph-layer{grid-template-columns:1fr}}
+@media(max-width:760px){.topbar{height:58px;padding:7px 9px;gap:8px}.brand-copy,.review-title,.review-state,.top-actions .secondary-action{display:none}.brand-mark{width:28px;height:28px}.view-tabs{margin-left:2px;height:36px}.tab{padding:0 10px}.top-actions{margin-left:auto}.top-actions .primary-action{min-height:32px;padding:0 8px}.export-menu{display:none}.workspace,.workspace.drawer-closed{height:calc(100vh - 58px);display:grid;grid-template-columns:1fr;grid-template-rows:176px minmax(0,1fr)}.workspace.graph-active,.workspace.graph-active.drawer-closed{grid-template-rows:minmax(0,1fr)}.file-panel{border-right:0;border-bottom:1px solid var(--line);padding-top:10px}.file-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.change-stats{display:none}.review-panel{min-height:0}.evidence-panel{top:58px;width:calc(100vw - 16px)}.column-heads span{padding-left:47px}.diff-row{grid-template-columns:minmax(300px,1fr) minmax(300px,1fr)}.graph-view{padding:14px}.graph-heading{align-items:flex-start;flex-direction:column;gap:4px}.graph-overview{grid-template-columns:1fr 1fr}.graph-step{min-height:66px}.graph-mode,.graph-controls{width:100%}.graph-mode button,.graph-controls select{flex:1;min-width:0}.graph-layer{grid-template-columns:1fr}.assistant-panel{right:8px;top:66px;bottom:8px;width:calc(100vw - 16px)}}
 """
 
 
@@ -2344,6 +2836,10 @@ let selectedFileId = null;
 let selectedRow = null;
 let comparison = null;
 let graphCache = null;
+let assistantMode = 'ask';
+let activeAgentRunId = null;
+let activeThreadId = '';
+let activeDeliveryId = null;
 const comparisonCache = new Map();
 const byId = id => document.getElementById(id);
 const clear = node => { while (node.firstChild) node.removeChild(node.firstChild); };
@@ -2456,6 +2952,7 @@ async function selectFile(id) {
   comparison = comparisonCache.get(id);
   renderComparison();
   renderFileOverview(file);
+  updateAssistantContext();
 }
 function openDrawer() {
   byId('evidencePanel').classList.remove('closed');
@@ -2618,6 +3115,7 @@ function selectChangedRow(index, node) {
   const row = comparison.rows[index];
   const hunk = proof.patch_hunks.find(item => row.hunk_ids.includes(item.id));
   renderLogicChain(hunk, row);
+  updateAssistantContext();
 }
 function renderLogicChain(hunk, row) {
   const target = byId('logic');
@@ -3125,6 +3623,232 @@ async function waitForReview() {
     await sleep(120);
   }
 }
+function currentAgentTarget() {
+  if (
+    selectedRow !== null
+    && comparison
+    && comparison.rows[selectedRow]
+  ) {
+    const row = comparison.rows[selectedRow];
+    const hunk = proof.patch_hunks.find(item =>
+      (row.hunk_ids || []).includes(item.id));
+    if (hunk) {
+      return {
+        type: 'hunk',
+        id: hunk.id,
+        label: `${hunk.path} · ${hunk.header}`
+      };
+    }
+  }
+  if (selectedFileId && proof) {
+    const file = proof.file_changes.find(item => item.id === selectedFileId);
+    if (file) return {type: 'file', id: file.id, label: file.path};
+  }
+  return {type: 'change', id: '', label: '完整变更'};
+}
+function updateAssistantContext() {
+  const target = currentAgentTarget();
+  byId('assistantContext').textContent = target.label;
+}
+function openAssistant() {
+  updateAssistantContext();
+  byId('assistantPanel').hidden = false;
+  byId('assistantPrompt').focus();
+}
+function closeAssistant() {
+  byId('assistantPanel').hidden = true;
+}
+function selectAssistantMode(mode) {
+  assistantMode = mode;
+  byId('askMode').classList.toggle('active', mode === 'ask');
+  byId('changeMode').classList.toggle('active', mode === 'change');
+  byId('assistantPrompt').placeholder = mode === 'ask'
+    ? '询问这处修改的原因、风险或测试覆盖…'
+    : '描述需要调整的行为，Pi 会修改代码并刷新 Review…';
+}
+function appendAssistantMessage(role, content, runId = '') {
+  const target = byId('assistantMessages');
+  const empty = target.querySelector('.assistant-empty');
+  if (empty) empty.remove();
+  let item = runId
+    ? target.querySelector(`[data-run-id="${CSS.escape(runId)}"]`)
+    : null;
+  if (!item) {
+    item = text('article', '', `assistant-message ${role}`);
+    if (runId) item.dataset.runId = runId;
+    item.append(
+      text('strong', role === 'user' ? '你' : 'CodeCairn'),
+      text('p', '')
+    );
+    target.appendChild(item);
+  }
+  const paragraph = item.querySelector('p');
+  paragraph.textContent += content;
+  target.scrollTop = target.scrollHeight;
+}
+function setAgentState(status, detail = '') {
+  const labels = {
+    queued: '等待启动',
+    starting: '正在启动 Pi',
+    running: '正在分析',
+    completed: '已完成',
+    failed: '执行失败',
+    cancelled: '已停止'
+  };
+  byId('agentState').textContent = detail || labels[status] || status;
+  const busy = ['queued', 'starting', 'running'].includes(status);
+  byId('sendAgent').disabled = busy;
+  byId('stopAgent').hidden = !busy;
+  if (!busy) activeAgentRunId = null;
+}
+async function submitAgent(event) {
+  event.preventDefault();
+  const prompt = byId('assistantPrompt').value.trim();
+  if (!prompt || activeAgentRunId) return;
+  const target = currentAgentTarget();
+  appendAssistantMessage('user', prompt);
+  byId('assistantPrompt').value = '';
+  setAgentState('queued');
+  try {
+    const response = await api('/api/agent/runs', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        thread_id: activeThreadId,
+        mode: assistantMode,
+        prompt,
+        target_type: target.type,
+        target_id: target.id
+      })
+    });
+    const run = await response.json();
+    activeAgentRunId = run.id;
+    activeThreadId = run.thread_id;
+    appendAssistantMessage('assistant', '', run.id);
+    setAgentState(run.status);
+  } catch (failure) {
+    setAgentState('failed', failure.message);
+    appendAssistantMessage('assistant', `无法启动：${failure.message}`);
+  }
+}
+async function stopAgent() {
+  if (!activeAgentRunId) return;
+  try {
+    await api(`/api/agent/runs/${activeAgentRunId}/abort`, {method: 'POST'});
+  } catch (failure) {
+    toast(`停止失败：${failure.message}`);
+  }
+}
+const deliveryStepNames = {
+  preflight: '交付预检',
+  branch: '准备分支',
+  stage: '暂存代码',
+  commit: '创建提交',
+  push: '推送远端',
+  pull_request: '创建 PR',
+  evidence: '发布证据链'
+};
+function renderDelivery(delivery) {
+  activeDeliveryId = delivery.id;
+  const target = byId('deliverySteps');
+  clear(target);
+  Object.keys(deliveryStepNames).forEach(name => {
+    const current = (delivery.steps || []).find(item => item.name === name);
+    const row = text('div', '', `delivery-step ${current?.status || 'pending'}`);
+    row.append(
+      document.createElement('i'),
+      text('strong', deliveryStepNames[name]),
+      text('span', current?.detail || (current ? current.status : '等待'))
+    );
+    target.appendChild(row);
+  });
+  const busy = !['completed', 'failed'].includes(delivery.status);
+  byId('startDelivery').disabled = busy;
+  byId('startDelivery').textContent = delivery.status === 'failed'
+    ? '重试交付' : delivery.status === 'completed' ? '交付完成' : '正在交付';
+  byId('deliveryError').hidden = !delivery.error;
+  byId('deliveryError').textContent = delivery.error || '';
+  byId('deliveryLink').hidden = !delivery.pr_url;
+  byId('deliveryLink').href = delivery.pr_url || '#';
+}
+function openDelivery() {
+  if (!proof) return;
+  const dialog = byId('deliveryDialog');
+  byId('deliveryScope').textContent =
+    `将提交本次已审查的 ${proof.file_changes.length} 个文件，并把 Change Proof 写入 PR。`;
+  const base = proof.git_snapshot.base_ref || 'main';
+  byId('deliveryBase').value = (
+    base === 'HEAD' || /^[0-9a-f]{40}$/i.test(base)
+  ) ? 'main' : base.replace(/^origin\//, '').replace(/^refs\/heads\//, '');
+  byId('deliveryMessage').value = proof.title.slice(0, 500);
+  byId('deliveryError').hidden = true;
+  if (!(byId('deliverySteps').children.length)) {
+    renderDelivery({
+      id: '',
+      status: 'failed',
+      steps: [],
+      error: '',
+      pr_url: ''
+    });
+    byId('startDelivery').disabled = false;
+    byId('startDelivery').textContent = '开始交付';
+  }
+  dialog.showModal();
+}
+async function submitDelivery(event) {
+  event.preventDefault();
+  byId('startDelivery').disabled = true;
+  byId('deliveryError').hidden = true;
+  try {
+    const response = await api('/api/deliveries', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        base_branch: byId('deliveryBase').value.trim(),
+        commit_message: byId('deliveryMessage').value.trim(),
+        selected_paths: []
+      })
+    });
+    renderDelivery(await response.json());
+  } catch (failure) {
+    byId('deliveryError').textContent = failure.message;
+    byId('deliveryError').hidden = false;
+    byId('startDelivery').disabled = false;
+    byId('startDelivery').textContent = '重试交付';
+  }
+}
+function connectEvents() {
+  const source = new EventSource('/api/events');
+  source.addEventListener('agent_text', event => {
+    const item = JSON.parse(event.data).payload;
+    appendAssistantMessage('assistant', item.delta || '', item.run_id);
+  });
+  source.addEventListener('agent_status', event => {
+    const item = JSON.parse(event.data).payload;
+    if (!activeAgentRunId || item.run_id === activeAgentRunId) {
+      activeAgentRunId = item.run_id;
+      setAgentState(item.status, item.error || '');
+    }
+  });
+  source.addEventListener('agent_tool', event => {
+    const item = JSON.parse(event.data).payload;
+    if (item.run_id === activeAgentRunId) {
+      setAgentState('running', item.tool ? `正在使用 ${item.tool}` : '正在执行工具');
+    }
+  });
+  source.addEventListener('proof_updated', () => {
+    comparisonCache.clear();
+    load().then(() => toast('代码与证据链已更新')).catch(failure =>
+      toast(`刷新失败：${failure.message}`));
+  });
+  source.addEventListener('delivery_status', event => {
+    const item = JSON.parse(event.data).payload.delivery;
+    if (!activeDeliveryId || item.id === activeDeliveryId) renderDelivery(item);
+  });
+  source.onerror = () => {
+    if (activeAgentRunId) setAgentState('running', '正在重新连接实时状态');
+  };
+}
 async function load() {
   await waitForReview();
   proof = await (await api('/api/proof')).json();
@@ -3158,8 +3882,18 @@ byId('toggleDrawer').addEventListener('click', openDrawer);
 byId('closeDrawer').addEventListener('click', closeDrawer);
 byId('diffButton').addEventListener('click', showDiff);
 byId('graphButton').addEventListener('click', showGraph);
+byId('assistantButton').addEventListener('click', openAssistant);
+byId('closeAssistant').addEventListener('click', closeAssistant);
+byId('askMode').addEventListener('click', () => selectAssistantMode('ask'));
+byId('changeMode').addEventListener('click', () => selectAssistantMode('change'));
+byId('assistantForm').addEventListener('submit', submitAgent);
+byId('stopAgent').addEventListener('click', stopAgent);
+byId('deliveryButton').addEventListener('click', openDelivery);
+byId('closeDelivery').addEventListener('click', () => byId('deliveryDialog').close());
+byId('deliveryForm').addEventListener('submit', submitDelivery);
 document.querySelectorAll('[data-export]').forEach(item =>
   item.addEventListener('click', () => exportEvidence(item.dataset.export)));
+connectEvents();
 load().catch(failure => {
   setLoadingMode(false);
   byId('title').textContent = '无法载入代码变更';
